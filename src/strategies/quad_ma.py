@@ -14,20 +14,47 @@ from src.indicators import (
     mcginley_dynamic, vidya
 )
 
+    def _params_to_idx(self, p: dict) -> int:
+        """
+        Inversa de get_params_by_index: convierte params en un global_idx.
+        """
+        t1 = self.ma_types.index(p['type_fe'])
+        t2 = self.ma_types.index(p['type_se'])
+        t3 = self.ma_types.index(p['type_fx'])
+        t4 = self.ma_types.index(p['type_sx'])
+        
+        # Encontrar índices de pares
+        p_entry = (p['fast_entry'], p['slow_entry'])
+        p_exit = (p['fast_exit'], p['slow_exit'])
+        
+        # Búsqueda de índice de par (lineal por ser solo ~210 elementos)
+        pair_entry_idx = -1
+        pair_exit_idx = -1
+        for i in range(self.n_pairs):
+            if self.legal_pairs[i, 0] == p_entry[0] and self.legal_pairs[i, 1] == p_entry[1]:
+                pair_entry_idx = i
+            if self.legal_pairs[i, 0] == p_exit[0] and self.legal_pairs[i, 1] == p_exit[1]:
+                pair_exit_idx = i
+        
+        idx_pairs = pair_entry_idx * self.n_pairs + pair_exit_idx
+        idx_types = (((t1 * self.n_types + t2) * self.n_types + t3) * self.n_types + t4)
+        
+        return idx_types * (self.n_pairs ** 2) + idx_pairs
+
 class QuadMAStrategy(BaseStrategy):
     """
-    Estrategia de 4 Medias Móviles con soporte para 14 tipos de indicadores.
-    Optimizada para GGAL con pre-cálculo de indicadores (Caching).
+    Estrategia Flex-MA: 4 Medias Móviles con tipos INDEPENDIENTES. 
+    Espacio de búsqueda escalado a ~1.7B de combinaciones.
     """
 
     def __init__(self):
-        super().__init__(name="QuadMA")
-        # Cache para evitar re-calcular indicadores en cada backtest del grid
+        super().__init__(name="FlexMA")
         self._ma_cache = {}
         
-        # Pre-calculamos los 820 pares legales de periodos (fe < se)
-        self.periods = np.arange(5, 205, 5).astype(np.int32).tolist()
-        self.periods.insert(0, 1)
+        # Resolución ajustada para escala masiva (step=10)
+        # Periodos: [1, 10, 20, ..., 200] -> 21 periodos
+        self.periods = np.arange(10, 210, 10).astype(np.int32).tolist()
+        self.periods.insert(0, 1) # Mantenemos el 1 como "naked price"
         
         legal_list = []
         for fe in self.periods:
@@ -36,81 +63,99 @@ class QuadMAStrategy(BaseStrategy):
                     legal_list.append((fe, se))
         
         self.legal_pairs = np.array(legal_list, dtype=np.int32)
+        self.n_pairs = len(self.legal_pairs) # Debería ser ~210
         
         self.ma_types = [
             'sma', 'ema', 'wma', 'hma', 'dema', 'tema', 'tma',
             'rma', 'zlema', 'kama', 'alma', 'vwma', 'mcginley', 'vidya'
         ]
+        self.n_types = len(self.ma_types)
 
     def get_params_by_index(self, global_idx: int) -> dict:
         """
-        Mapeo matemático: global_idx -> dict(params)
+        Decodificador Flex-MA para 1.7B combinaciones.
+        Mapeo: global_idx -> {Type1, Type2, Type3, Type4, PairEntry, PairExit}
         """
-        params_array = _get_params_jit(global_idx, len(self.legal_pairs), self.legal_pairs)
-        ma_idx = params_array[0]
-        fe, se = params_array[1], params_array[2]
-        fx, sx = params_array[3], params_array[4]
+        # 1. Extraer índices de pares de periodos
+        idx_pairs = global_idx % (self.n_pairs * self.n_pairs)
+        rem_types = global_idx // (self.n_pairs * self.n_pairs)
+        
+        pair_exit_idx = idx_pairs % self.n_pairs
+        pair_entry_idx = idx_pairs // self.n_pairs
+        
+        # 2. Extraer los 4 tipos de media
+        t4_idx = rem_types % self.n_types
+        rem_types //= self.n_types
+        t3_idx = rem_types % self.n_types
+        rem_types //= self.n_types
+        t2_idx = rem_types % self.n_types
+        t1_idx = rem_types // self.n_types
+        
+        # 3. Resolver valores reales
+        p_entry = self.legal_pairs[pair_entry_idx]
+        p_exit = self.legal_pairs[pair_exit_idx]
         
         return {
-            'ma_type': self.ma_types[ma_idx],
-            'fast_entry': int(fe),
-            'slow_entry': int(se),
-            'fast_exit': int(fx),
-            'slow_exit': int(sx)
+            'type_fe': self.ma_types[t1_idx],
+            'type_se': self.ma_types[t2_idx],
+            'type_fx': self.ma_types[t3_idx],
+            'type_sx': self.ma_types[t4_idx],
+            'fast_entry': int(p_entry[0]),
+            'slow_entry': int(p_entry[1]),
+            'fast_exit': int(p_exit[0]),
+            'slow_exit': int(p_exit[1])
         }
 
     @property
     def param_grid(self):
         """
-        Retorna un objeto LazyGrid que encapsula el generador de 9.4M de combinaciones.
+        Retorna el LazyGrid con el nuevo espacio de búsqueda de 1.7B.
         """
         from src.core.base_strategy import LazyGrid
-        total_combinations = len(self.ma_types) * len(self.legal_pairs) * len(self.legal_pairs)
+        # 14^4 * 210^2 = 38416 * 44100 = 1,694,145,600
+        total_combinations = (self.n_types ** 4) * (self.n_pairs ** 2)
         return LazyGrid(self._generate_combinations, total_combinations)
 
     def _generate_combinations(self):
-        """Generador interno simplificado usando el mapeo de pares."""
-        for ma in self.ma_types:
-            for fe, se in self.legal_pairs:
-                for fx, sx in self.legal_pairs:
-                    yield {
-                        'ma_type': ma,
-                        'fast_entry': int(fe),
-                        'slow_entry': int(se),
-                        'fast_exit': int(fx),
-                        'slow_exit': int(sx)
-                    }
+        """Generador compatible para Flex-MA (No recomendado para 1.7B, usar índices)."""
+        for t1 in self.ma_types:
+            for t2 in self.ma_types:
+                for t3 in self.ma_types:
+                    for t4 in self.ma_types:
+                        for entry in self.legal_pairs:
+                            for exit_p in self.legal_pairs:
+                                yield {
+                                    'type_fe': t1, 'type_se': t2, 'type_fx': t3, 'type_sx': t4,
+                                    'fast_entry': int(entry[0]), 'slow_entry': int(entry[1]),
+                                    'fast_exit': int(exit_p[0]), 'slow_exit': int(exit_p[1])
+                                }
 
     def generate_signal(self, data: np.ndarray, params: dict, indicator_map: dict = None) -> np.ndarray:
         """
-        Genera señales combinando 4 medias.
+        Genera señales combinando 4 medias con tipos independientes.
         """
-        ma_type = params['ma_type']
-        fe = params['fast_entry']
-        se = params['slow_entry']
-        fx = params['fast_exit']
-        sx = params['slow_exit']
+        t_fe, t_se = params['type_fe'], params['type_se']
+        t_fx, t_sx = params['type_fx'], params['type_sx']
+        fe, se = params['fast_entry'], params['slow_entry']
+        fx, sx = params['fast_exit'], params['slow_exit']
 
         if indicator_map:
-            fe_idx = indicator_map[(ma_type, fe)]
-            se_idx = indicator_map[(ma_type, se)]
-            fx_idx = indicator_map[(ma_type, fx)]
-            sx_idx = indicator_map[(ma_type, sx)]
+            fe_idx = indicator_map[(t_fe, fe)]
+            se_idx = indicator_map[(t_se, se)]
+            fx_idx = indicator_map[(t_fx, fx)]
+            sx_idx = indicator_map[(t_sx, sx)]
             
             return _compute_quad_ma_signals(
                 data[:, fe_idx], data[:, se_idx],
                 data[:, fx_idx], data[:, sx_idx]
             )
 
-        ma_fast_entry = self._get_ma(data, ma_type, fe)
-        ma_slow_entry = self._get_ma(data, ma_type, se)
-        ma_fast_exit = self._get_ma(data, ma_type, fx)
-        ma_slow_exit = self._get_ma(data, ma_type, sx)
+        ma_fe = self._get_ma(data, t_fe, fe)
+        ma_se = self._get_ma(data, t_se, se)
+        ma_fx = self._get_ma(data, t_fx, fx)
+        ma_sx = self._get_ma(data, t_sx, sx)
 
-        return _compute_quad_ma_signals(
-            ma_fast_entry, ma_slow_entry,
-            ma_fast_exit, ma_slow_exit
-        )
+        return _compute_quad_ma_signals(ma_fe, ma_se, ma_fx, ma_sx)
 
     def _get_ma(self, data: np.ndarray, ma_type: str, period: int) -> np.ndarray:
         """Selector de media con caching."""

@@ -18,6 +18,8 @@ from src.core.validation.validator_oos import ValidatorOOS
 from src.core.db_manager import BacktestDB
 from src.utils.logger import AsyncLogger
 from src.utils.process_guard import ProcessGuard
+from src.core.reporting.reporter import ResultsReporter
+from src.core.jit_ops import _extract_trades_jit, _compute_metrics_inplace_jit
 
 # --- INFRAESTRUCTURA DE NÚCLEOS AUTÓNOMOS ---
 _worker_indicator_matrix = None
@@ -95,40 +97,41 @@ def _worker_bt_chunk(args):
 @njit(fastmath=True, error_model='numpy', cache=True)
 def _njit_massive_loop_master(start_idx, end_idx, data, legal_pairs, map_matrix, n_w, w_size, thresh, comm, sig_buf):
     """
-    Motor Monolítico v2: Todo el pipeline de señales, supervivencia y métricas
-    en un solo bloque de código máquina. Cero overhead de llamadas.
+    Motor Flex-MA v3: Indización independiente para 1.7B combinaciones.
+    Todo inlined para máximo performance.
     """
     n_bars = data.shape[0]
     n_pairs = legal_pairs.shape[0]
+    n_types = map_matrix.shape[0]
     best_pf = -1.0
     best_idx = -1
     survivors = 0
     
     for i in range(start_idx, end_idx):
-        # --- 1. DECODER DE PARÁMETROS (Inline) ---
-        ma_type_idx = i // (n_pairs * n_pairs)
-        rem = i % (n_pairs * n_pairs)
-        entry_idx = rem // n_pairs
-        exit_idx = rem % n_pairs
+        # --- 1. DECODER FLEX-MA (Inline) ---
+        idx_pairs = i % (n_pairs * n_pairs)
+        rem_types = i // (n_pairs * n_pairs)
         
-        fe_se = legal_pairs[entry_idx]
-        fx_sx = legal_pairs[exit_idx]
+        pair_exit_idx = idx_pairs % n_pairs
+        pair_entry_idx = idx_pairs // n_pairs
         
-        fe, se = fe_se[0], fe_se[1]
-        fx, sx = fx_sx[0], fx_sx[1]
-
+        t4 = rem_types % n_types
+        rem_types //= n_types
+        t3 = rem_types % n_types
+        rem_types //= n_types
+        t2 = rem_types % n_types
+        t1 = rem_types // n_types
+        
+        p_entry = legal_pairs[pair_entry_idx]
+        p_exit = legal_pairs[pair_exit_idx]
+        
         # --- 2. RESOLVER COLUMNAS (Inline) ---
-        fe_p_idx = 0 if fe == 1 else fe // 5
-        se_p_idx = 0 if se == 1 else se // 5
-        fx_p_idx = 0 if fx == 1 else fx // 5
-        sx_p_idx = 0 if sx == 1 else sx // 5
-        
-        fe_col = map_matrix[ma_type_idx, fe_p_idx]
-        se_col = map_matrix[ma_type_idx, se_p_idx]
-        fx_col = map_matrix[ma_type_idx, fx_p_idx]
-        sx_col = map_matrix[ma_type_idx, sx_p_idx]
+        # Resolución step=10
+        fe_col = map_matrix[t1, 0 if p_entry[0] == 1 else p_entry[0] // 10]
+        se_col = map_matrix[t2, 0 if p_entry[1] == 1 else p_entry[1] // 10]
+        fx_col = map_matrix[t3, 0 if p_exit[0] == 1 else p_exit[0] // 10]
+        sx_col = map_matrix[t4, 0 if p_exit[1] == 1 else p_exit[1] // 10]
 
-        # --- 2.5 LOCALIZACIÓN DE DATOS (Speed Hack para evitar contención de Bus) ---
         fe_raw = data[:, fe_col]
         se_raw = data[:, se_col]
         fx_raw = data[:, fx_col]
@@ -245,6 +248,40 @@ class ValidationOrchestrator:
         self.oos_validator = ValidatorOOS(self.logger)
         self.db = BacktestDB()
         self.run_id = None
+        self.checkpoint_path = "results/checkpoints/flex_checkpoint.json"
+        self.log_file_path = "results/logs/flex_bt.log"
+
+    def _save_checkpoint(self, last_idx, best_pf, best_idx):
+        """Guarda el progreso y el estado de la optimización masiva."""
+        checkpoint = {
+            "last_idx": int(last_idx),
+            "best_pf": float(best_pf),
+            "best_idx": int(best_idx),
+            "run_id": self.run_id,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        with open(self.checkpoint_path, "w") as f:
+            json.dump(checkpoint, f, indent=4)
+
+    def _load_checkpoint(self):
+        """Carga el progreso previo si existe."""
+        if os.path.exists(self.checkpoint_path):
+            with open(self.checkpoint_path, "r") as f:
+                return json.load(f)
+        return None
+
+    def _log_to_file(self, message):
+        """Escribe logs enriquecidos en el archivo dedicado."""
+        with open(self.log_file_path, "a") as f:
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            # Texto enriquecido simple (ASCII art / decoradores)
+            if "SPEED" in message.upper():
+                decorator = ">>> "
+            elif "CHECKPOINT" in message.upper():
+                decorator = "[OK] "
+            else:
+                decorator = "    "
+            f.write(f"[{timestamp}] {decorator}{message}\n")
 
     def _warmup_jit(self, shm_name, shm_shape, map_matrix):
         """
@@ -382,114 +419,157 @@ class ValidationOrchestrator:
             self._run_diagnostic_benchmark(shm_name, shm_shape, map_matrix)
 
             # 5. Optimización / Backtesting Masivo (In-Sample) con Motor "Bola de Fuego"
-            total_p = 9413600
+            # 14^4 * 210^2
+            total_combinations = (self.strategy.n_types ** 4) * (self.strategy.n_pairs ** 2)
             
+            # --- SISTEMA DE CHECKPOINT ---
+            checkpoint = self._load_checkpoint()
+            start_idx = 0
+            best_pf = -1.0
+            best_idx = -1
+            
+            if checkpoint:
+                start_idx = checkpoint["last_idx"]
+                best_pf = checkpoint["best_pf"]
+                best_idx = checkpoint["best_idx"]
+                self.logger.log(f"REANUDANDO desde Checkpoint: {start_idx:,} BTs completados.")
+                self._log_to_file(f"REANUDANDO PROCESO DESDE {start_idx:,}")
+
             # --- USO DE MULTIPROCESSING.POOL ULTRA-BALANCEADO ---
             import multiprocessing as mp
-            # Usamos un número óptimo de núcleos (12) para evitar contención de bus
             n_cores = 12
-            self.logger.log(f"--- MOTOR MULTICORE 'BOLA DE FUEGO' ({n_cores} Cores - Shared Memory + Buffer Reuse) ---")
+            self.logger.log(f"--- MOTOR FLEX-MA ({n_cores} Cores - Checkpointing Activo) ---")
             
-            best_pf = -1
-            winner_params = None
-            survivors_count = 0
-            processed_count = 0
+            # Super-Batches de 50M para Checkpointing
+            super_batch_size = 50_000_000
+            processed_total = start_idx
             
-            # Configuración de logging fluido
-            log_threshold = 250000
-            next_log_target = log_threshold
-            
-            with mp.Pool(
-                processes=n_cores,
-                initializer=init_worker,
-                initargs=(
-                    shm_name,
-                    shm_shape,
-                    self.strategy.legal_pairs,
-                    map_matrix
-                )
-            ) as pool:
-                chunk_size = 25000 
-                tasks = []
-                all_is_results = []
-                for i in range(0, total_p, chunk_size):
-                    end = min(i + chunk_size, total_p)
-                    tasks.append(((i, end), self.strategy.__class__, self.config.commission_bps))
+            for sb_start in range(start_idx, total_combinations, super_batch_size):
+                sb_end = min(sb_start + super_batch_size, total_combinations)
+                self.logger.log(f"Iniciando Super-Batch: [{sb_start:,} -> {sb_end:,}]")
                 
-                try:
+                all_is_results = []
+                with mp.Pool(
+                    processes=n_cores,
+                    initializer=init_worker,
+                    initargs=(shm_name, shm_shape, self.strategy.legal_pairs, map_matrix)
+                ) as pool:
+                    chunk_size = 100_000 # Chunks más grandes para 1.7B
+                    tasks = []
+                    for i in range(sb_start, sb_end, chunk_size):
+                        end = min(i + chunk_size, sb_end)
+                        tasks.append(((i, end), self.strategy.__class__, self.config.commission_bps))
+                    
+                    batch_processed = 0
                     for res, count in pool.imap_unordered(_worker_bt_chunk, tasks):
-                        if isinstance(res, str) and res.startswith("ERROR"):
-                            self.logger.log(res)
-                        else:
-                            processed_count += count
-                            survivors_count += len(res)
-                            
+                        if not isinstance(res, str):
+                            batch_processed += count
+                            processed_total += count
                             for p, m in res:
                                 if m['profit_factor'] > best_pf:
                                     best_pf = m['profit_factor']
-                                    winner_params = p
-                            
-                            all_is_results.extend(res)
-                            
-                            # Lógica de log fluida para evitar saturación pero con feedback constante
-                            if processed_count >= next_log_target or processed_count == total_p:
-                                elapsed = time.time() - start_time
-                                throughput = processed_count / elapsed
-                                pct = (processed_count / total_p) * 100
-                                self.logger.log(f"[{pct:5.1f}%] {processed_count:,} BTs | Speed Total: {throughput:6.0f} BT/s | Best PF: {best_pf:.2f}")
-                                next_log_target += log_threshold
-                except Exception as pool_err:
-                    self.logger.log(f"FALLO CRÍTICO EN EL POOL: {str(pool_err)}")
-                finally:
-                    # SIEMPRE cerrar el pool pase lo que pase
-                    pool.terminate()
-                    pool.join()
-                    # Disparar también al guardián para estar 100% seguros
-                    ProcessGuard.get_instance().cleanup()
+                                    best_idx = self.strategy._params_to_idx(p) # Helpert para recuperar índice si es necesario
+                                all_is_results.append((p, m))
+                        
+                        # Logging masivo cada 100k
+                        if processed_total % 100_000 == 0:
+                            elapsed = time.time() - start_time
+                            throughput = processed_total / elapsed if elapsed > 0 else 0
+                            msg = f"SPEED: {processed_total:,} BTs | {throughput:,.0f} BT/s | Best PF: {best_pf:.2f}"
+                            self._log_to_file(msg)
+                            if processed_total % 1_000_000 == 0: # Feedback visual en consola menos frecuente
+                                pct = (processed_total / total_combinations) * 100
+                                self.logger.log(f"[{pct:5.2f}%] {processed_total:,} BTs | Best PF: {best_pf:.2f}")
+
+                # Fin de Super-Batch: Checkpoint y Persistencia
+                self._save_checkpoint(sb_end, best_pf, best_idx)
+                self._log_to_file(f"CHECKPOINT: Guardado en {sb_end:,}")
+                if all_is_results:
+                    self.db.save_is_batch(self.run_id, all_is_results)
 
             # 5.5 Persistencia masiva final (fuera del bucle crítico para maximizar throughput)
             if all_is_results:
                 self.logger.log(f"Guardando {len(all_is_results):,} estrategias IS en la base de datos de auditoría...")
                 self.db.save_is_batch(self.run_id, all_is_results)
 
-            self.logger.log(f"Supervivientes: {survivors_count} de {processed_count} procesados.")
+            self.logger.log(f"Supervivientes que superaron el filtro IS: {survivors_count} de {processed_count} procesados.")
             
-            if winner_params is None:
+            if not all_is_results:
                 self.logger.log("CRITICAL: Ninguna estrategia superó el filtro de supervivencia (PF > 1.0).")
                 return None
 
-            # El ganador IS requiere recalcular su señal final para los siguientes pasos
-            winner_signals_is = self.strategy.generate_signal(is_data, winner_params)
-
-            self.logger.log(f"Ganador IS: {winner_params} | PF: {best_pf:.2f}")
-
-            # 3. Permutation Test (Bar-Shuffling) sobre el Ganador
-            self.logger.log("Ejecutando Permutation Test (Monte Carlo)...")
-            p_val = self.permutation_tester.run_test(is_data[:, 1], winner_signals_is, best_pf)
-            status = "(Robusto)" if p_val < 0.05 else "(Poco Robusto)"
-            self.logger.log(f"Quasi P-Value: {p_val:.4f} {status}")
+            # --- FASE 6: VALIDACIÓN MASIVA Y REPORTING (Todos los supervivientes) ---
+            self.logger.log(f"Iniciando Validación Masiva para {len(all_is_results)} supervivientes...")
+            reporter = ResultsReporter(self.run_id)
+            final_reports = []
             
-            # Registrar resultado Montecarlo
-            self.db.save_montecarlo(self.run_id, winner_params, p_val, p_val < 0.05)
-
-            # 6. Validación Final OOS
-            self.logger.log("--- FASE FINAL: VALIDACIÓN OUT-OF-SAMPLE ---")
-            winner_signals_oos = self.strategy.generate_signal(oos_data, winner_params)
-            oos_results = self.oos_validator.validate(
-                oos_data, 
-                winner_signals_oos, 
-                str(winner_params), 
-                is_pf=best_pf, 
-                commission_bps=self.config.commission_bps
-            )
+            # Arrays de retornos y precios para regeneración rápida
+            is_returns = is_data[:, 1]
+            oos_returns = oos_data[:, 1]
+            is_prices = is_data[:, 0] # Asumimos close en col 0 (original)
+            # Nota: DataProcessor expande el dataset, debemos ver qué indice es close.
+            # En GGAL_1m: datetime,open,high,low,close,volume. Close es indice 4 original.
+            # Si se cargó con processor.load_data(), el processor sabe el índice.
+            close_col = self.processor.price_col_idx 
             
-            # Registrar resultado OOS final
-            self.db.save_oos(self.run_id, winner_params, oos_results)
+            is_prices = is_data[:, close_col]
+            oos_prices = oos_data[:, close_col]
+            
+            commission_factor = self.config.commission_bps / 10000.0
+
+            for idx, (params, metrics_is) in enumerate(all_is_results):
+                # 6.1 Generar señales completas (IS + OOS)
+                sig_is = self.strategy.generate_signal(is_data, params, indicator_map)
+                sig_oos = self.strategy.generate_signal(oos_data, params, indicator_map)
+                
+                # 6.2 Validación OOS
+                metrics_oos = self.oos_validator.validate(
+                    oos_data, sig_oos, f"Strategy_{idx}", 
+                    is_pf=metrics_is['profit_factor'], 
+                    commission_bps=self.config.commission_bps
+                )
+                
+                # 6.3 Montecarlo (Permutation Test)
+                p_val = self.permutation_tester.run_test(is_returns, sig_is, metrics_is['profit_factor'])
+                
+                # 6.4 Extracción de Trades (IS)
+                trades_is_raw = _extract_trades_jit(sig_is, is_prices, commission_factor)
+                trades_json = reporter.format_trades_to_json(trades_is_raw, is_data[:, 0]) # Usamos timestamp si es fecha
+                
+                # 6.5 Generación de Gráfico de Equity
+                # Re-calculamos retornos de estrategia para el plot
+                is_strat_ret = np.zeros(len(is_returns))
+                oos_strat_ret = np.zeros(len(oos_returns))
+                _compute_metrics_inplace_jit(is_returns, sig_is, commission_factor, is_strat_ret)
+                _compute_metrics_inplace_jit(oos_returns, sig_oos, commission_factor, oos_strat_ret)
+                
+                curve_path = reporter.generate_equity_curve(idx, is_strat_ret, oos_strat_ret, params)
+                
+                # 6.6 Consolidar reporte
+                final_reports.append({
+                    "id": idx,
+                    "params": params,
+                    "metrics_is": metrics_is,
+                    "metrics_oos": metrics_oos,
+                    "montecarlo_p": p_val,
+                    "trades": trades_json,
+                    "equity_curve_path": curve_path
+                })
+                
+                if (idx + 1) % 100 == 0 or (idx + 1) == len(all_is_results):
+                    self.logger.log(f"Reportes generados: {idx+1}/{len(all_is_results)}")
+
+            # 7. Persistencia Masiva y Reportes Finales
+            self.logger.log("Guardando reportes detallados en base de datos...")
+            self.db.save_strategy_report_batch(self.run_id, final_reports)
+            
+            metrics_table_path = reporter.save_consolidated_metrics(final_reports)
+            self.logger.log(f"Tabla de métricas consolidada generada en: {metrics_table_path}")
 
             total_time = time.time() - start_time
-            self.logger.log(f"Pipeline completado en {total_time:.2f} segundos.")
+            self.logger.log(f"Pipeline masivo completado en {total_time:.2f} segundos.")
             
-            return oos_results
+            return final_reports[0]['metrics_oos'] if final_reports else None # Retornamos algo por compatibilidad
 
         except Exception as e:
             self.logger.log(f"CRITICAL ERROR en el pipeline: {str(e)}")

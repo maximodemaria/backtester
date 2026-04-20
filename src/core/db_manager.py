@@ -72,6 +72,21 @@ class BacktestDB:
                 )
             """)
             
+            # NUEVA: Tabla de reportería total (supervivientes)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS strategy_report (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER,
+                    params TEXT,
+                    metrics_is TEXT,
+                    metrics_oos TEXT,
+                    montecarlo_p REAL,
+                    trades_json TEXT,
+                    equity_curve_path TEXT,
+                    FOREIGN KEY(run_id) REFERENCES runs(id)
+                )
+            """)
+            
             # Índices para búsquedas rápidas
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_is_run_id ON strategies_is(run_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_mc_run_id ON montecarlo_results(run_id)")
@@ -117,17 +132,28 @@ class BacktestDB:
             """, (run_id, json.dumps(params), p_val, is_robust))
             conn.commit()
 
-    def save_oos(self, run_id, params, results_dict):
+    def save_strategy_report_batch(self, run_id, reports):
+        """Guarda de forma masiva los reportes de los supervivientes."""
+        if not reports:
+            return
+            
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO oos_results (run_id, strategy_params, oos_pf, oos_sharpe, oos_return)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                run_id, 
-                json.dumps(params), 
-                results_dict.get('profit_factor'),
-                results_dict.get('sharpe'),
-                results_dict.get('return_pct')
-            ))
+            data = []
+            for r in reports:
+                data.append((
+                    run_id,
+                    json.dumps(r['params']),
+                    json.dumps(r['metrics_is']),
+                    json.dumps(r['metrics_oos']),
+                    r['montecarlo_p'],
+                    json.dumps(r['trades']),
+                    r['equity_curve_path']
+                ))
+                
+            cursor.executemany("""
+                INSERT INTO strategy_report 
+                (run_id, params, metrics_is, metrics_oos, montecarlo_p, trades_json, equity_curve_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, data)
             conn.commit()
