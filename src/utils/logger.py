@@ -11,8 +11,8 @@ class AsyncLogger:
     Sistema de logging balanceado para no bloquear el motor de cálculo HFT.
     Utiliza un proceso separado para manejar el flujo de salida.
     """
-    def __init__(self):
-        self.queue = multiprocessing.Queue()
+    def __init__(self, max_buffer: int = 1000):
+        self.queue = multiprocessing.Queue(maxsize=max_buffer)
         self.stop_event = multiprocessing.Event()
         self.process = multiprocessing.Process(
             target=self._logger_worker,

@@ -27,6 +27,11 @@ class DataProcessor:
 
         # Convertir a numpy asegurando memoria contigua
         close_prices = df['close'].values.astype(np.float64)
+        
+        # Validar estabilidad numérica (prevenir log(0) o log(negativo))
+        if np.any(close_prices <= 0):
+            print("WARNING: Detectados precios <= 0. Ajustando a epsilon para estabilidad.")
+            close_prices = np.where(close_prices <= 0, 1e-9, close_prices)
 
         # Calcular retornos logarítmicos usando Numba
         log_returns = self._calculate_log_returns(close_prices)

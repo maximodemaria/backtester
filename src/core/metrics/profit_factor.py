@@ -15,4 +15,7 @@ def profit_factor(strategy_returns: np.ndarray) -> float:
         elif r < 0:
             neg_returns_sum += abs(r)
             
-    return pos_returns_sum / neg_returns_sum if neg_returns_sum != 0 else 1.0
+    if neg_returns_sum == 0:
+        return 999.0 if pos_returns_sum > 0 else 1.0
+        
+    return pos_returns_sum / neg_returns_sum
