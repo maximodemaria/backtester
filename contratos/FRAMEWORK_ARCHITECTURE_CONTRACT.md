@@ -44,7 +44,17 @@ class MiEstrategia(BaseStrategy):
 
 ---
 
-## 3. Prevención de Lookahead Bias
+## 3. Configuración y Realismo Operativo
+
+Para garantizar que el framework sea configurable y refleje condiciones de mercado reales (HFT), se establecen las siguientes reglas:
+
+- **Estandarización vía YAML:** Todos los parámetros del entorno (datasets, comisiones, slippage) deben gestionarse exclusivamente a través de la carpeta [/templates/](file:///c:/Users/max/Desktop/Drive/backtester/templates/). Queda prohibido el hardcodeo de rutas o costos operativos.
+- **Deducción de Comisiones:** Las métricas finales deben ser siempre netas de comisiones. El motor central descuenta automáticamente el costo en cada cambio de posición basado en los `commission_bps` definidos en el template.
+- **Validación de Templates:** Toda ejecución debe iniciarse cargando un template válido (`EnvironmentConfig`). El sistema debe fallar tempranamente si el template está corrupto o incompleto.
+
+---
+
+## 4. Prevención de Lookahead Bias
 
 El sesgo de información futura es inaceptable. Se aplican las siguientes reglas:
 
@@ -54,7 +64,7 @@ El sesgo de información futura es inaceptable. Se aplican las siguientes reglas
 
 ---
 
-## 4. Optimización y Performance
+## 5. Optimización y Performance
 
 Para garantizar el rendimiento HFT:
 
@@ -64,7 +74,7 @@ Para garantizar el rendimiento HFT:
 
 ---
 
-## 5. Checklist de Calidad para el Desarrollador
+## 6. Checklist de Calidad para el Desarrollador
 
 - [ ] ¿La estrategia hereda de `BaseStrategy`?
 - [ ] ¿Se utilizan indicadores de `src.indicators` en lugar de implementaciones locales?
