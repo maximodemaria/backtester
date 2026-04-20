@@ -4,8 +4,3 @@ environment:
   dataset_path: "sample_data.csv"
   commission_bps: 5.0  # Comisiones en puntos básicos (1 bps = 0.0001)
   slippage_model: "basic"
-  
-# Parámetros de la estrategia por defecto
-strategy_params:
-  fast_period: 10
-  slow_period: 30
