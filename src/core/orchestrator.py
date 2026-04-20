@@ -15,6 +15,7 @@ from src.core.jit_ops import (
 from src.core.validation.survival_tester import SurvivalTester
 from src.core.validation.permutation_test import PermutationTest
 from src.core.validation.validator_oos import ValidatorOOS
+from src.core.db_manager import BacktestDB
 from src.utils.logger import AsyncLogger
 from src.utils.process_guard import ProcessGuard
 
@@ -22,31 +23,45 @@ from src.utils.process_guard import ProcessGuard
 _worker_indicator_matrix = None
 _worker_data = None
 _worker_legal_pairs = None
+_worker_sig_buf = None
 
 def init_worker(shm_name, shm_shape, legal_pairs, indicator_matrix):
     """Inicializa el núcleo conectándose a la memoria compartida (Zero-Copy)."""
-    global _worker_indicator_matrix, _worker_data, _worker_legal_pairs, _worker_shm
+    global _worker_indicator_matrix, _worker_data, _worker_legal_pairs, _worker_shm, _worker_sig_buf
     from src.core.data_processor import DataProcessor
     from multiprocessing.shared_memory import SharedMemory
+    import os
     
-    _worker_legal_pairs = legal_pairs
-    _worker_indicator_matrix = indicator_matrix
-    
-    # IMPORTANTE: Mantenemos la referencia de _worker_shm para que el buffer no se cierre en Windows
-    _worker_shm = SharedMemory(name=shm_name)
-    _worker_data = np.ndarray(shm_shape, dtype=np.float64, buffer=_worker_shm.buf)
+    try:
+        # Debug para Windows: Confirmar que el proceso hijo ha nacido
+        # print(f"[DEBUG-WORKER] Nacido Proceso {os.getpid()} - Conectando a {shm_name}...")
+        
+        _worker_legal_pairs = legal_pairs
+        _worker_indicator_matrix = indicator_matrix
+        
+        # IMPORTANTE: Mantenemos la referencia de _worker_shm para que el buffer no se cierre en Windows
+        _worker_shm = SharedMemory(name=shm_name)
+        _worker_data = np.ndarray(shm_shape, dtype=np.float64, buffer=_worker_shm.buf, order='F')
+        
+        # Asignación de memoria una sola vez por núcleo
+        _worker_sig_buf = np.zeros(shm_shape[0], dtype=np.int8)
+        
+        # print(f"[DEBUG-WORKER] Proceso {os.getpid()} listo y conectado.")
+    except Exception as e:
+        print(f"[FATAL-WORKER] Error al inicializar proceso {os.getpid()}: {str(e)}")
+        raise e
 
 def _worker_bt_chunk(args):
     """
     Función worker que utiliza el bucle maestro NJIT sobre datos compartidos.
     """
     range_tuple, strategy_class, commission_bps = args
-    global _worker_indicator_matrix, _worker_data, _worker_legal_pairs
+    global _worker_indicator_matrix, _worker_data, _worker_legal_pairs, _worker_sig_buf
     start_idx, end_idx = range_tuple
     
     try:
-        if _worker_data is None or _worker_indicator_matrix is None:
-            return "ERROR: Worker no inicializado", 0
+        if _worker_data is None or _worker_sig_buf is None:
+            return "ERROR: Buffers no inicializados", 0
             
         # Parámetros de supervivencia
         n_windows = 4
@@ -54,13 +69,6 @@ def _worker_bt_chunk(args):
         n_samples = len(_worker_data)
         window_size = n_samples // n_windows
         comm_factor = commission_bps / 10000.0
-        
-        # --- OPTIMIZACIÓN: REUSO DE BUFFERS POR WORKER ---
-        # Alocamos una vez por chunk lo que necesite el NJIT interno
-        # (Aunque lo ideal sería alocarlo en init_worker, para no complicar 
-        # la firma de mp.Pool, lo hacemos aquí una sola vez por cada bloque de 100k)
-        sig_buffer = np.zeros(n_samples, dtype=np.int8)
-        ret_buffer = np.zeros(n_samples, dtype=np.float64)
         
         # --- MOTOR BOLA DE FUEGO ---
         best_pf, best_idx, survivors = _njit_massive_loop_master(
@@ -70,8 +78,7 @@ def _worker_bt_chunk(args):
             _worker_indicator_matrix,
             n_windows, window_size, threshold,
             comm_factor,
-            sig_buffer,
-            ret_buffer
+            _worker_sig_buf
         )
         
         winner_res = []
@@ -85,8 +92,8 @@ def _worker_bt_chunk(args):
     except Exception as e:
         return f"ERROR: {str(e)}", 0
 
-@njit(fastmath=True, error_model='numpy')
-def _njit_massive_loop_master(start_idx, end_idx, data, legal_pairs, map_matrix, n_w, w_size, thresh, comm, sig_buf, ret_buf):
+@njit(fastmath=True, error_model='numpy', cache=True)
+def _njit_massive_loop_master(start_idx, end_idx, data, legal_pairs, map_matrix, n_w, w_size, thresh, comm, sig_buf):
     """
     Motor Monolítico v2: Todo el pipeline de señales, supervivencia y métricas
     en un solo bloque de código máquina. Cero overhead de llamadas.
@@ -121,19 +128,26 @@ def _njit_massive_loop_master(start_idx, end_idx, data, legal_pairs, map_matrix,
         fx_col = map_matrix[ma_type_idx, fx_p_idx]
         sx_col = map_matrix[ma_type_idx, sx_p_idx]
 
+        # --- 2.5 LOCALIZACIÓN DE DATOS (Speed Hack para evitar contención de Bus) ---
+        fe_raw = data[:, fe_col]
+        se_raw = data[:, se_col]
+        fx_raw = data[:, fx_col]
+        sx_raw = data[:, sx_col]
+        ret_raw = data[:, 1]
+        
         # --- 3. GENERACIÓN DE SEÑALES (Inline + Direct Access) ---
         current_pos = 0
         for j in range(n_bars):
             # Lógica de Salida
             if current_pos == 1:
-                if data[j, fx_col] < data[j, sx_col]: current_pos = 0
+                if fx_raw[j] < sx_raw[j]: current_pos = 0
             elif current_pos == -1:
-                if data[j, fx_col] > data[j, sx_col]: current_pos = 0
+                if fx_raw[j] > sx_raw[j]: current_pos = 0
             
             # Lógica de Entrada
             if current_pos == 0:
-                if data[j, fe_col] > data[j, se_col]: current_pos = 1
-                elif data[j, fe_col] < data[j, se_col]: current_pos = -1
+                if fe_raw[j] > se_raw[j]: current_pos = 1
+                elif fe_raw[j] < se_raw[j]: current_pos = -1
             
             sig_buf[j] = current_pos
 
@@ -150,7 +164,7 @@ def _njit_massive_loop_master(start_idx, end_idx, data, legal_pairs, map_matrix,
             prev_p = 0
             for k in range(win_start, win_end):
                 # Retorno de la barra (retorno * posición_anterior)
-                r = data[k, 1] * prev_p
+                r = ret_raw[k] * prev_p
                 # Comisiones (solo si cambia posición)
                 if sig_buf[k] != prev_p:
                     r -= abs(sig_buf[k] - prev_p) * comm
@@ -174,7 +188,7 @@ def _njit_massive_loop_master(start_idx, end_idx, data, legal_pairs, map_matrix,
         gross_losses = 0.0
         prev_p = 0
         for j in range(n_bars):
-            r = data[j, 1] * prev_p
+            r = ret_raw[j] * prev_p
             if sig_buf[j] != prev_p:
                 r -= abs(sig_buf[j] - prev_p) * comm
             
@@ -206,6 +220,8 @@ class ValidationOrchestrator:
         self.survival_tester = SurvivalTester(n_windows=4, threshold_pf=1.1)
         self.permutation_tester = PermutationTest(n_permutations=500)
         self.oos_validator = ValidatorOOS(self.logger)
+        self.db = BacktestDB()
+        self.run_id = None
 
     def _warmup_jit(self, shm_name, shm_shape, map_matrix):
         """
@@ -216,12 +232,11 @@ class ValidationOrchestrator:
         try:
             # Pre-alocación mínima para warmup
             sig_buf = np.zeros(shm_shape[0], dtype=np.int8)
-            ret_buf = np.zeros(shm_shape[0], dtype=np.float64)
             
             # Conectar localmente
             from multiprocessing.shared_memory import SharedMemory
             self._warmup_shm = SharedMemory(name=shm_name)
-            data = np.ndarray(shm_shape, dtype=np.float64, buffer=self._warmup_shm.buf)
+            data = np.ndarray(shm_shape, dtype=np.float64, buffer=self._warmup_shm.buf, order='F')
             
             # Ejecutar un pequeño bloque para forzar compilación
             _ = _njit_massive_loop_master(
@@ -230,7 +245,7 @@ class ValidationOrchestrator:
                 self.strategy.legal_pairs, 
                 map_matrix, 
                 4, len(data) // 4, 1.1, 0.0006, 
-                sig_buf, ret_buf
+                sig_buf
             )
             self.logger.log("Motor JIT listo y caliente.")
         except Exception as e:
@@ -249,12 +264,11 @@ class ValidationOrchestrator:
         try:
             self.logger.log(f"Configurando buffers para {n_test} backtests...")
             sig_buf = np.zeros(shm_shape[0], dtype=np.int8)
-            ret_buf = np.zeros(shm_shape[0], dtype=np.float64)
             
             self.logger.log("Conectando a buffers de memoria compartida...")
             from multiprocessing.shared_memory import SharedMemory
             self._diag_shm = SharedMemory(name=shm_name)
-            data = np.ndarray(shm_shape, dtype=np.float64, buffer=self._diag_shm.buf)
+            data = np.ndarray(shm_shape, dtype=np.float64, buffer=self._diag_shm.buf, order='F')
             
             self.logger.log("Ejecutando motor de cálculo...")
             t_start = time.perf_counter()
@@ -264,7 +278,7 @@ class ValidationOrchestrator:
                 self.strategy.legal_pairs, 
                 map_matrix, 
                 4, len(data) // 4, 1.1, 0.0006, 
-                sig_buf, ret_buf
+                sig_buf
             )
             t_end = time.perf_counter()
             
@@ -294,6 +308,15 @@ class ValidationOrchestrator:
         start_time = time.time()
         self.logger.log(f"Iniciando Pipeline para estrategia: {self.strategy.name}")
         self.logger.log(f"Configuración cargada: {self.config.dataset_path} | Comm: {self.config.commission_bps} bps")
+        
+        # 0. Iniciar trazabilidad en base de datos
+        self.run_id = self.db.create_run(
+            self.strategy.name, 
+            os.path.basename(self.config.dataset_path), # O el nombre del template si estuviera disponible
+            self.config.commission_bps,
+            self.config.dataset_path
+        )
+        self.logger.log(f"Sesión de auditoría iniciada. ID: {self.run_id} | DB: {self.db.db_path}")
 
         try:
             # 1. Carga y Procesamiento
@@ -340,8 +363,8 @@ class ValidationOrchestrator:
             
             # --- USO DE MULTIPROCESSING.POOL ULTRA-BALANCEADO ---
             import multiprocessing as mp
-            # Usamos un número bajo de núcleos (4) para asegurar que el sistema respire
-            n_cores = 4
+            # Usamos un número óptimo de núcleos (12) para evitar contención de bus
+            n_cores = 12
             self.logger.log(f"--- MOTOR MULTICORE 'BOLA DE FUEGO' ({n_cores} Cores - Shared Memory + Buffer Reuse) ---")
             
             best_pf = -1
@@ -359,8 +382,9 @@ class ValidationOrchestrator:
                     map_matrix
                 )
             ) as pool:
-                chunk_size = 100000 
+                chunk_size = 500000 
                 tasks = []
+                all_is_results = []
                 for i in range(0, total_p, chunk_size):
                     end = min(i + chunk_size, total_p)
                     tasks.append(((i, end), self.strategy.__class__, self.config.commission_bps))
@@ -377,6 +401,9 @@ class ValidationOrchestrator:
                                 if m['profit_factor'] > best_pf:
                                     best_pf = m['profit_factor']
                                     winner_params = p
+                            
+                            # Acumular resultados en buffer (la persistencia se hará al final)
+                            all_is_results.extend(res)
 
                             # Log más frecuente para ver el arranque (cada chunk)
                             if processed_count % chunk_size == 0 or processed_count >= total_p:
@@ -393,14 +420,10 @@ class ValidationOrchestrator:
                     # Disparar también al guardián para estar 100% seguros
                     ProcessGuard.get_instance().cleanup()
 
-            # Limpieza de Memoria Compartida
-            if self.processor._shm:
-                try:
-                    self.processor._shm.close()
-                    self.processor._shm.unlink()
-                    self.logger.log("Memoria compartida liberada correctamente.")
-                except:
-                    pass
+            # 5.5 Persistencia masiva final (fuera del bucle crítico para maximizar throughput)
+            if all_is_results:
+                self.logger.log(f"Guardando {len(all_is_results):,} estrategias IS en la base de datos de auditoría...")
+                self.db.save_is_batch(self.run_id, all_is_results)
 
             self.logger.log(f"Supervivientes: {survivors_count} de {processed_count} procesados.")
             
@@ -418,6 +441,9 @@ class ValidationOrchestrator:
             p_val = self.permutation_tester.run_test(is_data[:, 1], winner_signals_is, best_pf)
             status = "(Robusto)" if p_val < 0.05 else "(Poco Robusto)"
             self.logger.log(f"Quasi P-Value: {p_val:.4f} {status}")
+            
+            # Registrar resultado Montecarlo
+            self.db.save_montecarlo(self.run_id, winner_params, p_val, p_val < 0.05)
 
             # 6. Validación Final OOS
             self.logger.log("--- FASE FINAL: VALIDACIÓN OUT-OF-SAMPLE ---")
@@ -429,6 +455,9 @@ class ValidationOrchestrator:
                 is_pf=best_pf, 
                 commission_bps=self.config.commission_bps
             )
+            
+            # Registrar resultado OOS final
+            self.db.save_oos(self.run_id, winner_params, oos_results)
 
             total_time = time.time() - start_time
             self.logger.log(f"Pipeline completado en {total_time:.2f} segundos.")

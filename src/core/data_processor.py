@@ -133,7 +133,7 @@ class DataProcessor:
         self._shm = shared_memory.SharedMemory(create=True, size=data.nbytes)
         
         # Mapear numpy array al segmento
-        shared_array = np.ndarray(data.shape, dtype=data.dtype, buffer=self._shm.buf)
+        shared_array = np.ndarray(data.shape, dtype=data.dtype, buffer=self._shm.buf, order='F')
         shared_array[:] = data[:]
         
         return self._shm.name, data.shape
