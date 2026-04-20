@@ -1,15 +1,30 @@
+"""
+Punto de entrada principal para la ejecución del framework de backtesting.
+Permite configurar la estrategia y el entorno mediante argumentos de línea de comandos.
+"""
 import os
 import argparse
+import warnings
+
+# Silenciar advertencias de redundancia de Numba antes de cargar los módulos
+from numba.core.errors import NumbaDeprecationWarning, NumbaPendingDeprecationWarning
+warnings.simplefilter('ignore', category=NumbaDeprecationWarning)
+warnings.simplefilter('ignore', category=RuntimeWarning)
+
 from src.strategies.moving_average import MovingAverageStrategy
+from src.strategies.quad_ma import QuadMAStrategy
 from src.core.orchestrator import ValidationOrchestrator
 from src.core.config_loader import EnvironmentConfig
 from src.utils.data_gen import generate_sample_data
 
 # CONFIGURACIÓN GLOBAL POR DEFECTO
-DEFAULT_STRATEGY = "MovingAverage"
-DEFAULT_TEMPLATE = "default"
+DEFAULT_STRATEGY = "QuadMA"
+DEFAULT_TEMPLATE = "ggal_hft"
 
 def str2bool(v):
+    """
+    Convierte una cadena en un valor booleano para argparse.
+    """
     if isinstance(v, bool):
         return v
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
@@ -24,17 +39,17 @@ def main():
     Punto de entrada CLI para el Framework de Backtesting.
     """
     parser = argparse.ArgumentParser(description="Framework de Backtesting Cuantitativo HFT")
-    
+
     parser.add_argument(
-        "--strategy", 
-        type=str, 
+        "--strategy",
+        type=str,
         default=DEFAULT_STRATEGY,
         help=f"Nombre de la clase de estrategia a ejecutar (default: {DEFAULT_STRATEGY})"
     )
-    
+
     parser.add_argument(
-        "--template", 
-        type=str, 
+        "--template",
+        type=str,
         default=DEFAULT_TEMPLATE,
         help=f"Nombre del archivo YAML en /templates/ (default: {DEFAULT_TEMPLATE})"
     )
@@ -44,7 +59,7 @@ def main():
     # 1. Cargar Configuración desde Template
     try:
         config = EnvironmentConfig(args.template)
-    except Exception as e:
+    except (ValueError, FileNotFoundError, KeyError) as e:
         print(f"ERROR DE CONFIGURACIÓN: {str(e)}")
         return
 
@@ -54,14 +69,15 @@ def main():
         generate_sample_data(config.dataset_path, n_rows=10000)
 
     # 3. Instanciar Estrategia
-    # Por ahora soportamos MovingAverage dinámicamente
     if args.strategy == "MovingAverage":
         strategy = MovingAverageStrategy()
+    elif args.strategy == "QuadMA":
+        strategy = QuadMAStrategy()
     else:
         print(f"Error: Estrategia '{args.strategy}' no reconocida.")
         return
 
-    print(f"--- Iniciando Backtester Framework ---")
+    print("--- Iniciando Backtester Framework ---")
     print(f"Estrategia: {strategy.name}")
     print(f"Template: {args.template}")
     print(f"Comisiones: {config.commission_bps} bps")

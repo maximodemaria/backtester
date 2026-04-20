@@ -1,8 +1,20 @@
-"""
-Definición de la interfaz base para estrategias de trading.
-"""
 from abc import ABC, abstractmethod
 import numpy as np
+
+class LazyGrid:
+    """
+    Wrapper para generadores que permite reportar un tamaño total.
+    Ideal para optimización de memoria en grids masivos.
+    """
+    def __init__(self, generator_func, total_count):
+        self.generator_func = generator_func
+        self.total_count = total_count
+
+    def __iter__(self):
+        return self.generator_func()
+
+    def __len__(self):
+        return self.total_count
 
 class BaseStrategy(ABC):
     """
@@ -15,10 +27,9 @@ class BaseStrategy(ABC):
 
     @property
     @abstractmethod
-    def param_grid(self) -> list:
+    def param_grid(self):
         """
-        Retorna una lista de diccionarios con las combinaciones a testear.
-        Ejemplo: return [{'fast': 10, 'slow': 20}, {'fast': 20, 'slow': 50}]
+        Retorna un iterable (lista o LazyGrid) de diccionarios con las combinaciones.
         """
 
     @abstractmethod

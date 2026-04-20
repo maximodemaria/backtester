@@ -9,12 +9,12 @@ def k_efficiency_ratio(data: np.ndarray, period: int) -> np.ndarray:
     if n < period: return er
     
     for i in range(period, n):
-        path = abs(data[i] - data[i - period])
-        vol = np.sum(np.abs(np.diff(data[i - period:i + 1])))
-        er[i] = path / vol if vol != 0 else 0.0
+        change = np.abs(data[i] - data[i - period])
+        diffs = data[i-period+1:i+1] - data[i-period:i]
+        vol = np.sum(np.abs(diffs))
+        er[i] = change / vol if vol != 0 else 0.0
     return er
 
 # =============================================================================
 # BLOQUE 2: OSCILADORES (MOMENTUM)
-# =============================================================================
 

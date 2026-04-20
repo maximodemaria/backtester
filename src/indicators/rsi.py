@@ -8,7 +8,7 @@ def rsi(data: np.ndarray, period: int) -> np.ndarray:
     result = np.full(n, np.nan, dtype=np.float64)
     if n <= period: return result
     
-    deltas = np.diff(data)
+    deltas = data[1:] - data[:-1]
     gains = np.maximum(deltas, 0.0)
     losses = np.maximum(-deltas, 0.0)
     

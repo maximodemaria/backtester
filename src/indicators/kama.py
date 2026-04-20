@@ -11,10 +11,10 @@ def kama(data: np.ndarray, period: int, fast: int = 2, slow: int = 30) -> np.nda
     # Efficiency Ratio (ER)
     change = np.abs(data[period:] - data[:-period])
     volatility = np.zeros(n - period, dtype=np.float64)
-    
-    abs_diff = np.abs(np.diff(data))
+    # Eficiencia de Diferencia Absoluta manual para evitar errores de contigüidad
+    abs_diff = np.abs(data[1:] - data[:-1])
     for i in range(n - period):
-        volatility[i] = np.sum(abs_diff[i:i+period])
+        volatility[i] = np.sum(abs_diff[i:i+period-1])
         
     er = np.zeros(n, dtype=np.float64)
     er[period:] = change / volatility

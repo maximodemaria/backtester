@@ -5,6 +5,9 @@ from .wma import wma
 @njit(cache=True)
 def hma(data: np.ndarray, period: int) -> np.ndarray:
     """Hull Moving Average (HMA)."""
+    if period <= 1:
+        return data.copy()
+        
     half_period = int(period / 2)
     sqrt_period = int(np.sqrt(period))
     

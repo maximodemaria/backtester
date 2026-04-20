@@ -6,7 +6,10 @@ def wma(data: np.ndarray, period: int) -> np.ndarray:
     """Weighted Moving Average (WMA) - Lineal."""
     n = len(data)
     result = np.full(n, np.nan, dtype=np.float64)
-    if n < period: return result
+    if period <= 0:
+        return result
+    if period == 1:
+        return data.copy()
     
     weight_sum = period * (period + 1) / 2
     for i in range(period - 1, n):

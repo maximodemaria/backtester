@@ -36,7 +36,6 @@ class SurvivalTester:
         n_samples = len(log_returns)
         window_size = n_samples // self.n_windows
 
-        # Ejecutamos el filtro lógico AND optimizado en Numba
         return _check_survival_jit(
             log_returns,
             configurations_signals,
@@ -48,28 +47,37 @@ class SurvivalTester:
     def check_single_survival(self, data: np.ndarray, signals: np.ndarray) -> bool:
         """
         Verifica la supervivencia de una única configuración.
-        Útil para el modo profiling/streaming.
         """
         log_returns = data[:, 1]
         n_samples = len(log_returns)
         window_size = n_samples // self.n_windows
-
-        for w in range(self.n_windows):
-            start = w * window_size
-            end = (w + 1) * window_size
-
-            # Extraemos vistas de la ventana
-            w_returns = log_returns[start:end]
-            w_signals = signals[start:end]
-
-            # Calculamos PF simplificado para velocidad
-            metrics = _compute_metrics_jit(w_returns, w_signals)
-            profit_factor = metrics[0]
-
-            if profit_factor < self.threshold_pf:
-                return False
         
-        return True
+        return _check_single_survival_jit(
+            log_returns, 
+            signals, 
+            self.n_windows, 
+            window_size, 
+            self.threshold_pf
+        )
+
+@njit(cache=True)
+def _check_single_survival_jit(log_returns, signals, n_windows, window_size, threshold):
+    """
+    Evaluación de supervivencia ultra-rápida (NJIT).
+    """
+    for w in range(n_windows):
+        start = w * window_size
+        end = (w + 1) * window_size
+        
+        w_returns = log_returns[start:end]
+        w_signals = signals[start:end]
+        
+        # profit_factor atomico desde backtester
+        from src.core.backtester import _compute_metrics_jit
+        metrics = _compute_metrics_jit(w_returns, w_signals)
+        if metrics[0] < threshold:
+            return False
+    return True
 
 @njit(parallel=True, cache=True)
 def _check_survival_jit(log_returns, signals_matrix, n_windows, window_size, threshold):
