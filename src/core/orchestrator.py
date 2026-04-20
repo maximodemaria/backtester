@@ -135,23 +135,63 @@ def _njit_massive_loop_master(start_idx, end_idx, data, legal_pairs, map_matrix,
         sx_raw = data[:, sx_col]
         ret_raw = data[:, 1]
         
-        # --- 3. GENERACIÓN DE SEÑALES (Inline + Direct Access) ---
+        # --- 3. GENERACIÓN DE SEÑALES Y CÁLCULO DE MÉTRICAS (Trade-Based + Pruning) ---
         current_pos = 0
+        prev_pos = 0
+        gross_profits = 0.0
+        gross_losses = 0.0
+        current_trade_ret = 0.0
+        
         for j in range(n_bars):
             # Lógica de Salida
+            new_pos = current_pos
             if current_pos == 1:
-                if fx_raw[j] < sx_raw[j]: current_pos = 0
+                if fx_raw[j] < sx_raw[j]: new_pos = 0
             elif current_pos == -1:
-                if fx_raw[j] > sx_raw[j]: current_pos = 0
+                if fx_raw[j] > sx_raw[j]: new_pos = 0
             
             # Lógica de Entrada
-            if current_pos == 0:
-                if fe_raw[j] > se_raw[j]: current_pos = 1
-                elif fe_raw[j] < se_raw[j]: current_pos = -1
+            if new_pos == 0:
+                if fe_raw[j] > se_raw[j]: new_pos = 1
+                elif fe_raw[j] < se_raw[j]: new_pos = -1
             
+            # --- CÁLCULO DE MÉTRICAS TRADE-BASED INLINE ---
+            # Acumular retorno de la barra antes de cambiar posición
+            if current_pos != 0:
+                current_trade_ret += current_pos * ret_raw[j]
+            
+            # Detectar cambio para aplicar comisiones y cerrar trades
+            if new_pos != current_pos:
+                cost = abs(new_pos - current_pos) * comm
+                if current_pos != 0:
+                    # Cerramos trade o Reversal
+                    if new_pos == 0 or (new_pos * current_pos < 0):
+                        net_trade_ret = current_trade_ret - cost
+                        if net_trade_ret > 0: gross_profits += net_trade_ret
+                        else: gross_losses += abs(net_trade_ret)
+                        current_trade_ret = 0.0
+                    else:
+                        current_trade_ret -= cost # Aumento de posición
+                else:
+                    # Entrada desde 0
+                    current_trade_ret -= cost
+            
+            current_pos = new_pos
             sig_buf[j] = current_pos
 
-        # --- 4. FILTRO DE SUPERVIVENCIA (Inline) ---
+        # Forzar cierre del último trade
+        if current_pos != 0:
+            net_trade_ret = current_trade_ret - abs(current_pos) * comm
+            if net_trade_ret > 0: gross_profits += net_trade_ret
+            else: gross_losses += abs(net_trade_ret)
+
+        # --- 4. ETAPA DE PRUNING TEMPRANO ---
+        pf = gross_profits / gross_losses if gross_losses > 0 else (999.0 if gross_profits > 0 else 0.0)
+        
+        if pf <= 1.0:
+            continue
+
+        # --- 5. FILTRO DE SUPERVIVENCIA (Solo para ganadoras) ---
         is_survivor = True
         for w in range(n_w):
             win_start = w * w_size
@@ -163,9 +203,7 @@ def _njit_massive_loop_master(start_idx, end_idx, data, legal_pairs, map_matrix,
             
             prev_p = 0
             for k in range(win_start, win_end):
-                # Retorno de la barra (retorno * posición_anterior)
                 r = ret_raw[k] * prev_p
-                # Comisiones (solo si cambia posición)
                 if sig_buf[k] != prev_p:
                     r -= abs(sig_buf[k] - prev_p) * comm
                 
@@ -183,25 +221,10 @@ def _njit_massive_loop_master(start_idx, end_idx, data, legal_pairs, map_matrix,
             continue
 
         survivors += 1
-        # --- 5. CÁLCULO DE MÉTRICAS (Profit Factor Inline) ---
-        gross_profits = 0.0
-        gross_losses = 0.0
-        prev_p = 0
-        for j in range(n_bars):
-            r = ret_raw[j] * prev_p
-            if sig_buf[j] != prev_p:
-                r -= abs(sig_buf[j] - prev_p) * comm
-            
-            if r > 0: gross_profits += r
-            elif r < 0: gross_losses += abs(r)
-            prev_p = sig_buf[j]
-            
-        pf = gross_profits / gross_losses if gross_losses > 0 else (100.0 if gross_profits > 0 else 0.0)
         
-        if pf > 1.0:
-            if pf > best_pf:
-                best_pf = pf
-                best_idx = i
+        if pf > best_pf:
+            best_pf = pf
+            best_idx = i
                 
     return best_pf, best_idx, survivors
 
@@ -372,6 +395,10 @@ class ValidationOrchestrator:
             survivors_count = 0
             processed_count = 0
             
+            # Configuración de logging fluido
+            log_threshold = 250000
+            next_log_target = log_threshold
+            
             with mp.Pool(
                 processes=n_cores,
                 initializer=init_worker,
@@ -382,7 +409,7 @@ class ValidationOrchestrator:
                     map_matrix
                 )
             ) as pool:
-                chunk_size = 500000 
+                chunk_size = 25000 
                 tasks = []
                 all_is_results = []
                 for i in range(0, total_p, chunk_size):
@@ -402,15 +429,15 @@ class ValidationOrchestrator:
                                     best_pf = m['profit_factor']
                                     winner_params = p
                             
-                            # Acumular resultados en buffer (la persistencia se hará al final)
                             all_is_results.extend(res)
-
-                            # Log más frecuente para ver el arranque (cada chunk)
-                            if processed_count % chunk_size == 0 or processed_count >= total_p:
+                            
+                            # Lógica de log fluida para evitar saturación pero con feedback constante
+                            if processed_count >= next_log_target or processed_count == total_p:
                                 elapsed = time.time() - start_time
                                 throughput = processed_count / elapsed
                                 pct = (processed_count / total_p) * 100
-                                self.logger.log(f"[{pct:5.1f}%] {processed_count:,} BTs | Speed: {throughput:6.0f} BT/s | Best PF: {best_pf:.2f}")
+                                self.logger.log(f"[{pct:5.1f}%] {processed_count:,} BTs | Speed Total: {throughput:6.0f} BT/s | Best PF: {best_pf:.2f}")
+                                next_log_target += log_threshold
                 except Exception as pool_err:
                     self.logger.log(f"FALLO CRÍTICO EN EL POOL: {str(pool_err)}")
                 finally:

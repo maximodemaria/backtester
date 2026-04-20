@@ -2,5 +2,5 @@
 environment:
   name: "ggal_hft_institutional"
   dataset_path: "data/GGAL_1m.csv"
-  commission_bps: 6.05  # 0.05% broker + 21% IVA sobre comisión
+  commission_bps: 6.05 # 0.05% broker + 21% IVA sobre comisión
   slippage_model: "basic"
