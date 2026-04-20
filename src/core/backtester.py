@@ -14,8 +14,22 @@ class BacktesterEngine:
     def run(data: np.ndarray, signals: np.ndarray) -> dict:
         """
         Ejecuta el cálculo de métricas sobre un set de datos y señales.
+        Incluye validación de Lookahead Bias.
         """
         log_returns = data[:, 1]
+        
+        # --- HARD CHECK: LOOKAHEAD BIAS ---
+        # Verificamos si hay una correlación sospechosa (perfecta) entre la señal
+        # y el retorno del mismo periodo antes del desplazamiento.
+        # Si corr(signals, log_returns) == 1.0 o -1.0, es casi seguro que 
+        # la señal usa información del precio de cierre actual para posicionarse.
+        if len(signals) > 10:
+            correlation = np.corrcoef(signals, log_returns)[0, 1]
+            assert abs(correlation) < 0.99, (
+                f"POTENCIAL LOOKAHEAD BIAS DETECTADO: Correlación signal/return = {correlation:.4f}. "
+                "La estrategia parece usar información del futuro."
+            )
+
         metrics = _compute_metrics_jit(log_returns, signals)
 
         return {

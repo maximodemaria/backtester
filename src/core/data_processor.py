@@ -35,6 +35,10 @@ class DataProcessor:
         self.processed_data = np.ascontiguousarray(
             np.column_stack((close_prices, log_returns))
         )
+        
+        # Hard check de contigüidad para asegurar Zero-Copy en Numba
+        assert self.processed_data.flags['C_CONTIGUOUS'], "Error: Los datos procesados deben ser contiguos en memoria."
+        
         return self.processed_data
 
     @staticmethod
