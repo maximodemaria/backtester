@@ -11,6 +11,10 @@ from numba.core.errors import NumbaDeprecationWarning, NumbaPendingDeprecationWa
 warnings.simplefilter('ignore', category=NumbaDeprecationWarning)
 warnings.simplefilter('ignore', category=RuntimeWarning)
 
+# --- PROTOCOLO DE SEGURIDAD ANTI-ZOBIES ---
+from src.utils.process_guard import init_global_guard
+init_global_guard()
+
 from src.strategies.moving_average import MovingAverageStrategy
 from src.strategies.quad_ma import QuadMAStrategy
 from src.core.orchestrator import ValidationOrchestrator

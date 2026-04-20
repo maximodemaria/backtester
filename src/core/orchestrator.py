@@ -16,6 +16,7 @@ from src.core.validation.survival_tester import SurvivalTester
 from src.core.validation.permutation_test import PermutationTest
 from src.core.validation.validator_oos import ValidatorOOS
 from src.utils.logger import AsyncLogger
+from src.utils.process_guard import ProcessGuard
 
 # --- INFRAESTRUCTURA DE NÚCLEOS AUTÓNOMOS ---
 _worker_indicator_matrix = None
@@ -337,10 +338,10 @@ class ValidationOrchestrator:
             # 5. Optimización / Backtesting Masivo (In-Sample) con Motor "Bola de Fuego"
             total_p = 9413600
             
-            # --- USO DE MULTIPROCESSING.POOL BALANCEADO ---
+            # --- USO DE MULTIPROCESSING.POOL ULTRA-BALANCEADO ---
             import multiprocessing as mp
-            # Usamos la mitad de los núcleos para dejar margen al sistema
-            n_cores = max(1, os.cpu_count() // 2)
+            # Usamos un número bajo de núcleos (4) para asegurar que el sistema respire
+            n_cores = 4
             self.logger.log(f"--- MOTOR MULTICORE 'BOLA DE FUEGO' ({n_cores} Cores - Shared Memory + Buffer Reuse) ---")
             
             best_pf = -1
@@ -385,6 +386,12 @@ class ValidationOrchestrator:
                                 self.logger.log(f"[{pct:5.1f}%] {processed_count:,} BTs | Speed: {throughput:6.0f} BT/s | Best PF: {best_pf:.2f}")
                 except Exception as pool_err:
                     self.logger.log(f"FALLO CRÍTICO EN EL POOL: {str(pool_err)}")
+                finally:
+                    # SIEMPRE cerrar el pool pase lo que pase
+                    pool.terminate()
+                    pool.join()
+                    # Disparar también al guardián para estar 100% seguros
+                    ProcessGuard.get_instance().cleanup()
 
             # Limpieza de Memoria Compartida
             if self.processor._shm:
