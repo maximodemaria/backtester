@@ -15,16 +15,17 @@ class ValidatorOOS:
         self.logger = logger
         self.engine = BacktesterEngine()
 
-    def validate(self, oos_data: np.ndarray, signals: np.ndarray, config_name: str, is_pf: float = 0.0) -> dict:
+    def validate(self, oos_data: np.ndarray, signals: np.ndarray, config_name: str, 
+                 is_pf: float = 0.0, commission_bps: float = 0.0) -> dict:
         """
         Ejecuta la validación final y reporta resultados.
-        Compara contra el rendimiento IS para detectar sobre-ajuste.
+        Compara contra el rendimiento IS para detectar sobre-ajuste e incluye comisiones.
         """
         if self.logger:
             self.logger.log(f"Iniciando Validación OOS para: {config_name}")
 
-        # Cálculo de métricas finales
-        results = self.engine.run(oos_data, signals)
+        # Cálculo de métricas finales integrando comisiones
+        results = self.engine.run(oos_data, signals, commission_bps=commission_bps)
         oos_pf = results['profit_factor']
 
         if self.logger:

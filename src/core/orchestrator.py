@@ -16,9 +16,10 @@ class ValidationOrchestrator:
     Gestiona el pipeline completo desde la carga de datos hasta la validación OOS.
     """
 
-    def __init__(self, strategy, data_path: str):
+    def __init__(self, strategy, config):
         self.strategy = strategy
-        self.processor = DataProcessor(data_path)
+        self.config = config
+        self.processor = DataProcessor(config.dataset_path)
         self.logger = AsyncLogger()
         self.backtester = BacktesterEngine()
         self.survival_tester = SurvivalTester(n_windows=4, threshold_pf=1.1)
@@ -27,10 +28,11 @@ class ValidationOrchestrator:
 
     def run_pipeline(self):
         """
-        Ejecuta el pipeline de validación extremo.
+        Ejecuta el pipeline de validación extremo con soporte para templates.
         """
         start_time = time.time()
         self.logger.log(f"Iniciando Pipeline para estrategia: {self.strategy.name}")
+        self.logger.log(f"Configuración cargada: {self.config.dataset_path} | Comm: {self.config.commission_bps} bps")
 
         try:
             # 1. Carga y Procesamiento
@@ -56,7 +58,7 @@ class ValidationOrchestrator:
                 # Test de Supervivencia Inmediato (Streaming)
                 if self.survival_tester.check_single_survival(is_data, signals):
                     survivors_count += 1
-                    metrics = self.backtester.run(is_data, signals)
+                    metrics = self.backtester.run(is_data, signals, commission_bps=self.config.commission_bps)
                     is_results.append((params, metrics))
                     
                     # Actualizar ganador
@@ -83,7 +85,13 @@ class ValidationOrchestrator:
             # 6. Validación Final OOS
             self.logger.log("--- FASE FINAL: VALIDACIÓN OUT-OF-SAMPLE ---")
             winner_signals_oos = self.strategy.generate_signal(oos_data, winner_params)
-            oos_results = self.oos_validator.validate(oos_data, winner_signals_oos, str(winner_params), is_pf=best_pf)
+            oos_results = self.oos_validator.validate(
+                oos_data, 
+                winner_signals_oos, 
+                str(winner_params), 
+                is_pf=best_pf, 
+                commission_bps=self.config.commission_bps
+            )
 
             total_time = time.time() - start_time
             self.logger.log(f"Pipeline completado en {total_time:.2f} segundos.")

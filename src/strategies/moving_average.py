@@ -48,7 +48,6 @@ def _compute_cross_signals(fast_ma: np.ndarray, slow_ma: np.ndarray) -> np.ndarr
 
     for i in range(n):
         # Las comparaciones con NaN (periodos incompletos) devuelven False.
-        # Esto evita señales espurias al inicio del dataset.
         if fast_ma[i] > slow_ma[i]:
             signals[i] = 1
         elif fast_ma[i] < slow_ma[i]:
