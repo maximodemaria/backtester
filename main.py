@@ -5,6 +5,10 @@ from src.core.orchestrator import ValidationOrchestrator
 from src.core.config_loader import EnvironmentConfig
 from src.utils.data_gen import generate_sample_data
 
+# CONFIGURACIÓN GLOBAL POR DEFECTO
+DEFAULT_STRATEGY = "MovingAverage"
+DEFAULT_TEMPLATE = "default"
+
 def str2bool(v):
     if isinstance(v, bool):
         return v
@@ -24,15 +28,15 @@ def main():
     parser.add_argument(
         "--strategy", 
         type=str, 
-        default="MovingAverage",
-        help="Nombre de la clase de estrategia a ejecutar (ej. MovingAverage)"
+        default=DEFAULT_STRATEGY,
+        help=f"Nombre de la clase de estrategia a ejecutar (default: {DEFAULT_STRATEGY})"
     )
     
     parser.add_argument(
         "--template", 
         type=str, 
-        default="default",
-        help="Nombre del archivo YAML en /templates/ (sin extensión)"
+        default=DEFAULT_TEMPLATE,
+        help=f"Nombre del archivo YAML en /templates/ (default: {DEFAULT_TEMPLATE})"
     )
 
     args = parser.parse_args()
