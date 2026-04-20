@@ -7,10 +7,10 @@ import numpy as np
 from src.core.data_processor import DataProcessor
 from src.core.backtester import BacktesterEngine
 from src.core.jit_ops import (
-    _get_params_jit,
-    _get_signals_by_indices_inplace_jit,
-    _check_single_survival_jit,
-    _compute_metrics_inplace_jit
+    _njit_execution_engine,
+    _extract_trades_jit,
+    _compute_metrics_inplace_jit,
+    _check_single_survival_jit
 )
 from src.core.validation.survival_tester import SurvivalTester
 from src.core.validation.permutation_test import PermutationTest
@@ -19,38 +19,31 @@ from src.core.db_manager import BacktestDB
 from src.utils.logger import AsyncLogger
 from src.utils.process_guard import ProcessGuard
 from src.core.reporting.reporter import ResultsReporter
-from src.core.jit_ops import _extract_trades_jit, _compute_metrics_inplace_jit
+
+import json
 
 # --- INFRAESTRUCTURA DE NÚCLEOS AUTÓNOMOS ---
 _worker_indicator_matrix = None
 _worker_data = None
 _worker_legal_pairs = None
 _worker_sig_buf = None
+_worker_shared_metrics = None # Obsoleto
 
 def init_worker(shm_name, shm_shape, legal_pairs, indicator_matrix):
     """Inicializa el núcleo conectándose a la memoria compartida (Zero-Copy)."""
     global _worker_indicator_matrix, _worker_data, _worker_legal_pairs, _worker_shm, _worker_sig_buf
     from src.core.data_processor import DataProcessor
     from multiprocessing.shared_memory import SharedMemory
-    import os
     
     try:
-        # Debug para Windows: Confirmar que el proceso hijo ha nacido
-        # print(f"[DEBUG-WORKER] Nacido Proceso {os.getpid()} - Conectando a {shm_name}...")
-        
         _worker_legal_pairs = legal_pairs
         _worker_indicator_matrix = indicator_matrix
         
-        # IMPORTANTE: Mantenemos la referencia de _worker_shm para que el buffer no se cierre en Windows
         _worker_shm = SharedMemory(name=shm_name)
         _worker_data = np.ndarray(shm_shape, dtype=np.float64, buffer=_worker_shm.buf, order='F')
-        
-        # Asignación de memoria una sola vez por núcleo
         _worker_sig_buf = np.zeros(shm_shape[0], dtype=np.int8)
-        
-        # print(f"[DEBUG-WORKER] Proceso {os.getpid()} listo y conectado.")
     except Exception as e:
-        print(f"[FATAL-WORKER] Error al inicializar proceso {os.getpid()}: {str(e)}")
+        print(f"[FATAL-WORKER] Error al inicializar proceso: {str(e)}")
         raise e
 
 def _worker_bt_chunk(args):
@@ -58,7 +51,7 @@ def _worker_bt_chunk(args):
     Función worker que utiliza el bucle maestro NJIT sobre datos compartidos.
     """
     range_tuple, strategy_class, commission_bps = args
-    global _worker_indicator_matrix, _worker_data, _worker_legal_pairs, _worker_sig_buf
+    global _worker_indicator_matrix, _worker_data, _worker_legal_pairs, _worker_sig_buf, _worker_shared_metrics
     start_idx, end_idx = range_tuple
     
     try:
@@ -71,165 +64,187 @@ def _worker_bt_chunk(args):
         n_samples = len(_worker_data)
         window_size = n_samples // n_windows
         comm_factor = commission_bps / 10000.0
+
+        # --- MOTOR HFT-ENGINE ---
+        bh_ret = np.sum(_worker_data[:, 1])
         
-        # --- MOTOR BOLA DE FUEGO ---
-        best_pf, best_idx, survivors = _njit_massive_loop_master(
+        res = _njit_massive_loop_master(
             start_idx, end_idx,
             _worker_data,
-            _worker_legal_pairs,
+            strategy_class().get_logic_id(),
+            _worker_legal_pairs, 
             _worker_indicator_matrix,
             n_windows, window_size, threshold,
             comm_factor,
-            _worker_sig_buf
+            _worker_sig_buf,
+            bh_ret
         )
         
-        winner_res = []
-        if best_idx != -1:
-            strategy = strategy_class()
-            winner_params = strategy.get_params_by_index(best_idx)
-            winner_res.append((winner_params, {"profit_factor": best_pf}))
-            
-        return winner_res, (end_idx - start_idx)
+        return res
 
     except Exception as e:
-        return f"ERROR: {str(e)}", 0
+        return (0.0, -1, 0, 0, 0)
 
 @njit(fastmath=True, error_model='numpy', cache=True)
-def _njit_massive_loop_master(start_idx, end_idx, data, legal_pairs, map_matrix, n_w, w_size, thresh, comm, sig_buf):
+def _njit_massive_loop_master(start_idx, end_idx, data, logic_id, strategy_metadata, map_matrix, n_w, w_size, thresh, comm, sig_buf, bh_ret):
     """
-    Motor Flex-MA v3: Indización independiente para 1.7B combinaciones.
-    Todo inlined para máximo performance.
+    Motor HFT-ENGINE v5: Arquitectura consolidada con Pruning Multinivel.
+    Capa 1: Retorno vs Buy & Hold (0.7x).
+    Capa 2: Profit Factor > 1.0.
+    Capa 3: Filtro de Supervivencia (Drawdown).
     """
-    n_bars = data.shape[0]
-    n_pairs = legal_pairs.shape[0]
-    n_types = map_matrix.shape[0]
     best_pf = -1.0
     best_idx = -1
     survivors = 0
+    cap1_survivors = 0
+    evaluated_total = 0
+    
+    n_pairs = strategy_metadata.shape[0] if logic_id == 1 else 0
+    n_types = map_matrix.shape[0]
+    ret_raw = data[:, 1]
+    n_bars = data.shape[0]
     
     for i in range(start_idx, end_idx):
-        # --- 1. DECODER FLEX-MA (Inline) ---
-        idx_pairs = i % (n_pairs * n_pairs)
-        rem_types = i // (n_pairs * n_pairs)
+        evaluated_total += 1
         
-        pair_exit_idx = idx_pairs % n_pairs
-        pair_entry_idx = idx_pairs // n_pairs
-        
-        t4 = rem_types % n_types
-        rem_types //= n_types
-        t3 = rem_types % n_types
-        rem_types //= n_types
-        t2 = rem_types % n_types
-        t1 = rem_types // n_types
-        
-        p_entry = legal_pairs[pair_entry_idx]
-        p_exit = legal_pairs[pair_exit_idx]
-        
-        # --- 2. RESOLVER COLUMNAS (Inline) ---
-        # Resolución step=10
-        fe_col = map_matrix[t1, 0 if p_entry[0] == 1 else p_entry[0] // 10]
-        se_col = map_matrix[t2, 0 if p_entry[1] == 1 else p_entry[1] // 10]
-        fx_col = map_matrix[t3, 0 if p_exit[0] == 1 else p_exit[0] // 10]
-        sx_col = map_matrix[t4, 0 if p_exit[1] == 1 else p_exit[1] // 10]
+        # --- 1. DECODER DE PARÁMETROS ---
+        params_vec = np.zeros(8, dtype=np.float64) 
+        if logic_id == 1:
+            # Inline FlexMA Decoder
+            idx_pairs = i % (n_pairs * n_pairs)
+            rem_types = i // (n_pairs * n_pairs)
+            p_entry = strategy_metadata[idx_pairs // n_pairs]
+            p_exit = strategy_metadata[idx_pairs % n_pairs]
+            t4 = rem_types % n_types
+            rem_types //= n_types
+            t3 = rem_types % n_types
+            rem_types //= n_types
+            t2 = rem_types % n_types
+            t1 = rem_types // n_types
+            
+            params_vec[0] = map_matrix[t1, 0 if p_entry[0] == 1 else p_entry[0] // 10]
+            params_vec[1] = map_matrix[t2, 0 if p_entry[1] == 1 else p_entry[1] // 10]
+            params_vec[2] = map_matrix[t3, 0 if p_exit[0] == 1 else p_exit[0] // 10]
+            params_vec[3] = map_matrix[t4, 0 if p_exit[1] == 1 else p_exit[1] // 10]
 
-        fe_raw = data[:, fe_col]
-        se_raw = data[:, se_col]
-        fx_raw = data[:, fx_col]
-        sx_raw = data[:, sx_col]
-        ret_raw = data[:, 1]
-        
-        # --- 3. GENERACIÓN DE SEÑALES Y CÁLCULO DE MÉTRICAS (Trade-Based + Pruning) ---
+        # --- 2. EJECUCIÓN DE SEÑALES ---
+        _njit_execution_engine(data, logic_id, params_vec, sig_buf)
+
+        # --- 3. PRUNING CAPA 1 (Retorno vs BH 0.7x) ---
+        strat_ret = 0.0
         current_pos = 0
-        prev_pos = 0
+        for j in range(n_bars):
+            new_pos = sig_buf[j]
+            if current_pos != 0: strat_ret += current_pos * ret_raw[j]
+            if new_pos != current_pos: strat_ret -= abs(new_pos - current_pos) * comm
+            current_pos = new_pos
+        if current_pos != 0: strat_ret -= abs(current_pos) * comm
+
+        if strat_ret < (0.7 * bh_ret):
+            continue
+        cap1_survivors += 1
+
+        # --- 4. MÉTRICAS TRADE-BASED (Agnóstico) ---
         gross_profits = 0.0
         gross_losses = 0.0
         current_trade_ret = 0.0
+        current_pos = 0
         
         for j in range(n_bars):
-            # Lógica de Salida
-            new_pos = current_pos
-            if current_pos == 1:
-                if fx_raw[j] < sx_raw[j]: new_pos = 0
-            elif current_pos == -1:
-                if fx_raw[j] > sx_raw[j]: new_pos = 0
-            
-            # Lógica de Entrada
-            if new_pos == 0:
-                if fe_raw[j] > se_raw[j]: new_pos = 1
-                elif fe_raw[j] < se_raw[j]: new_pos = -1
-            
-            # --- CÁLCULO DE MÉTRICAS TRADE-BASED INLINE ---
-            # Acumular retorno de la barra antes de cambiar posición
-            if current_pos != 0:
-                current_trade_ret += current_pos * ret_raw[j]
-            
-            # Detectar cambio para aplicar comisiones y cerrar trades
+            new_pos = sig_buf[j]
+            if current_pos != 0: current_trade_ret += current_pos * ret_raw[j]
             if new_pos != current_pos:
                 cost = abs(new_pos - current_pos) * comm
                 if current_pos != 0:
-                    # Cerramos trade o Reversal
                     if new_pos == 0 or (new_pos * current_pos < 0):
                         net_trade_ret = current_trade_ret - cost
                         if net_trade_ret > 0: gross_profits += net_trade_ret
                         else: gross_losses += abs(net_trade_ret)
                         current_trade_ret = 0.0
-                    else:
-                        current_trade_ret -= cost # Aumento de posición
-                else:
-                    # Entrada desde 0
-                    current_trade_ret -= cost
-            
+                    else: current_trade_ret -= cost
+                else: current_trade_ret -= cost
             current_pos = new_pos
-            sig_buf[j] = current_pos
 
-        # Forzar cierre del último trade
         if current_pos != 0:
             net_trade_ret = current_trade_ret - abs(current_pos) * comm
             if net_trade_ret > 0: gross_profits += net_trade_ret
             else: gross_losses += abs(net_trade_ret)
 
-        # --- 4. ETAPA DE PRUNING TEMPRANO ---
         pf = gross_profits / gross_losses if gross_losses > 0 else (999.0 if gross_profits > 0 else 0.0)
         
+        # PRUNING CAPA 2 (Rentabilidad)
         if pf <= 1.0:
             continue
 
-        # --- 5. FILTRO DE SUPERVIVENCIA (Solo para ganadoras) ---
+        # --- 5. FILTRO DE SUPERVIVENCIA (Drawdown) ---
         is_survivor = True
         for w in range(n_w):
             win_start = w * w_size
             win_end = win_start + w_size
-            
             w_drawdown = 0.0
             w_peak = 0.0
             w_cum_ret = 0.0
-            
             prev_p = 0
             for k in range(win_start, win_end):
                 r = ret_raw[k] * prev_p
-                if sig_buf[k] != prev_p:
-                    r -= abs(sig_buf[k] - prev_p) * comm
-                
+                if sig_buf[k] != prev_p: r -= abs(sig_buf[k] - prev_p) * comm
                 w_cum_ret += r
                 if w_cum_ret > w_peak: w_peak = w_cum_ret
                 dd = w_peak - w_cum_ret
                 if dd > w_drawdown: w_drawdown = dd
                 prev_p = sig_buf[k]
-
             if w_drawdown > thresh:
                 is_survivor = False
                 break
         
-        if not is_survivor:
-            continue
+        if not is_survivor: continue
 
         survivors += 1
-        
         if pf > best_pf:
             best_pf = pf
             best_idx = i
                 
-    return best_pf, best_idx, survivors
+    return best_pf, best_idx, survivors, float(evaluated_total), float(cap1_survivors)
+
+def _monitor_thread_func(metrics_dict, stop_event, run_id):
+    """Hilo independiente que reporta telemetría cada 10 segundos."""
+    from src.utils.logger import AsyncLogger
+    import time
+    logger = AsyncLogger(run_id)
+    last_audit = 0
+    t_last = time.time()
+    
+    logger.log("[MONITOR] Telemetría asíncrona (Thread-mode) iniciada.")
+    
+    try:
+        while not stop_event.is_set():
+            time.sleep(10)
+            
+            audit = metrics_dict["audit"]
+            discard = metrics_dict["discard"]
+            survive = metrics_dict["survive"]
+            
+            t_now = time.time()
+            dt = t_now - t_last
+            new_audit = audit - last_audit
+            speed = new_audit / dt if dt > 0 else 0
+            
+            discard_pct = (discard / audit * 100) if audit > 0 else 0
+            
+            logger.log(
+                f"[TELEMETRÍA] | Auditadas: {audit:,} | Descartadas C1: {discard:,} "
+                f"({discard_pct:.1f}%) | Supervivientes: {survive:,} | "
+                f"Velocidad: {speed:,.0f} cfg/s"
+            )
+            
+            last_audit = audit
+            t_last = t_now
+            
+    except Exception as e:
+        print(f"[MONITOR-ERROR] {str(e)}")
+    finally:
+        logger.log("[MONITOR] Telemetría finalizada.")
+        logger.stop()
 
 class ValidationOrchestrator:
     """
@@ -299,13 +314,16 @@ class ValidationOrchestrator:
             data = np.ndarray(shm_shape, dtype=np.float64, buffer=self._warmup_shm.buf, order='F')
             
             # Ejecutar un pequeño bloque para forzar compilación
+            bh_ret = np.sum(data[:, 1])
             _ = _njit_massive_loop_master(
                 0, 100, 
                 data, 
+                self.strategy.get_logic_id(),
                 self.strategy.legal_pairs, 
                 map_matrix, 
                 4, len(data) // 4, 1.1, 0.0006, 
-                sig_buf
+                sig_buf,
+                bh_ret
             )
             self.logger.log("Motor JIT listo y caliente.")
         except Exception as e:
@@ -335,16 +353,29 @@ class ValidationOrchestrator:
             _ = _njit_massive_loop_master(
                 0, n_test, 
                 data, 
+                self.strategy.get_logic_id(),
                 self.strategy.legal_pairs, 
                 map_matrix, 
                 4, len(data) // 4, 1.1, 0.0006, 
-                sig_buf
+                sig_buf,
+                np.sum(data[:, 1])
             )
             t_end = time.perf_counter()
             
             ms_total = (t_end - t_start) * 1000
             ms_per_bt = ms_total / n_test
             bt_per_sec = n_test / (t_end - t_start)
+            
+            # --- PROCESAMIENTO DE RESULTADOS DEL BLOQUE ---
+            total_evaluated = 0
+            total_c1_survivors = 0
+            batch_survivors = 0
+            
+            # Reporte Performance
+            t_end = time.perf_counter()
+            elapsed = t_end - t_start
+            bt_s = n_test / elapsed
+            self.logger.log(f"Block Speed: {bt_s:,.0f} BT/s | Bloque finalizado.")
             
             self.logger.log(f"Muestra: {n_test:,} Backtests")
             self.logger.log(f"Tiempo Total: {ms_total:.2f} ms")
@@ -416,13 +447,9 @@ class ValidationOrchestrator:
             self._warmup_jit(shm_name, shm_shape, map_matrix)
             
             # 4. Diagnóstico de Performance (Solicitado por el usuario)
-            self._run_diagnostic_benchmark(shm_name, shm_shape, map_matrix)
-
-            # 5. Optimización / Backtesting Masivo (In-Sample) con Motor "Bola de Fuego"
-            # 14^4 * 210^2
+            self._run_diagnostic_benchmark            # 5. Optimización / Backtesting Masivo (In-Sample) con HFT-ENGINE v5
             total_combinations = (self.strategy.n_types ** 4) * (self.strategy.n_pairs ** 2)
             
-            # --- SISTEMA DE CHECKPOINT ---
             checkpoint = self._load_checkpoint()
             start_idx = 0
             best_pf = -1.0
@@ -435,67 +462,72 @@ class ValidationOrchestrator:
                 self.logger.log(f"REANUDANDO desde Checkpoint: {start_idx:,} BTs completados.")
                 self._log_to_file(f"REANUDANDO PROCESO DESDE {start_idx:,}")
 
-            # --- USO DE MULTIPROCESSING.POOL ULTRA-BALANCEADO ---
             import multiprocessing as mp
-            n_cores = 12
-            self.logger.log(f"--- MOTOR FLEX-MA ({n_cores} Cores - Checkpointing Activo) ---")
+            import threading
+            self.metrics_dict = {"audit": start_idx, "discard": 0, "survive": 0}
+            self.stop_monitor = threading.Event()
             
-            # Super-Batches de 50M para Checkpointing
+            # Lanzar Hilo Monitor
+            monitor_thread = threading.Thread(
+                target=_monitor_thread_func, 
+                args=(self.metrics_dict, self.stop_monitor, self.run_id),
+                daemon=True
+            )
+            monitor_thread.start()
+
+            n_cores = 12
+            self.logger.log(f"--- MOTOR HFT-ENGINE ({n_cores} Cores - Capa 1 Activa) ---")
+            
             super_batch_size = 50_000_000
             processed_total = start_idx
+            all_is_results = []
             
             for sb_start in range(start_idx, total_combinations, super_batch_size):
                 sb_end = min(sb_start + super_batch_size, total_combinations)
                 self.logger.log(f"Iniciando Super-Batch: [{sb_start:,} -> {sb_end:,}]")
+                b_start = time.perf_counter()
                 
-                all_is_results = []
+                block_evaluated = 0
+                block_c1_survivors = 0
+                
                 with mp.Pool(
                     processes=n_cores,
                     initializer=init_worker,
                     initargs=(shm_name, shm_shape, self.strategy.legal_pairs, map_matrix)
                 ) as pool:
-                    chunk_size = 100_000 # Chunks más grandes para 1.7B
+                    chunk_size = 100_000
                     tasks = []
                     for i in range(sb_start, sb_end, chunk_size):
                         end = min(i + chunk_size, sb_end)
                         tasks.append(((i, end), self.strategy.__class__, self.config.commission_bps))
                     
-                    batch_processed = 0
-                    for res, count in pool.imap_unordered(_worker_bt_chunk, tasks):
-                        if not isinstance(res, str):
-                            batch_processed += count
-                            processed_total += count
-                            for p, m in res:
-                                if m['profit_factor'] > best_pf:
-                                    best_pf = m['profit_factor']
-                                    best_idx = self.strategy._params_to_idx(p) # Helpert para recuperar índice si es necesario
-                                all_is_results.append((p, m))
-                        
-                        # Logging masivo cada 100k
-                        if processed_total % 100_000 == 0:
-                            elapsed = time.time() - start_time
-                            throughput = processed_total / elapsed if elapsed > 0 else 0
-                            msg = f"SPEED: {processed_total:,} BTs | {throughput:,.0f} BT/s | Best PF: {best_pf:.2f}"
-                            self._log_to_file(msg)
-                            if processed_total % 1_000_000 == 0: # Feedback visual en consola menos frecuente
-                                pct = (processed_total / total_combinations) * 100
-                                self.logger.log(f"[{pct:5.2f}%] {processed_total:,} BTs | Best PF: {best_pf:.2f}")
-
-                # Fin de Super-Batch: Checkpoint y Persistencia
+                    for res in pool.imap_unordered(_worker_bt_chunk, tasks):
+                        # res: (best_pf, b_idx, survivors, ev, c1)
+                        if len(res) == 5:
+                            b_pf, b_idx, surv, ev, c1 = res
+                            # Actualizar métricas para el Monitor
+                            self.metrics_dict["audit"] += ev
+                            self.metrics_dict["discard"] += (ev - c1)
+                            self.metrics_dict["survive"] += surv
+                            
+                            if b_idx != -1 and b_pf > best_pf:
+                                best_pf = b_pf
+                                best_idx = int(b_idx)
+                
+                # Marcamos checkpoint
                 self._save_checkpoint(sb_end, best_pf, best_idx)
-                self._log_to_file(f"CHECKPOINT: Guardado en {sb_end:,}")
-                if all_is_results:
-                    self.db.save_is_batch(self.run_id, all_is_results)
 
-            # 5.5 Persistencia masiva final (fuera del bucle crítico para maximizar throughput)
-            if all_is_results:
-                self.logger.log(f"Guardando {len(all_is_results):,} estrategias IS en la base de datos de auditoría...")
-                self.db.save_is_batch(self.run_id, all_is_results)
-
-            self.logger.log(f"Supervivientes que superaron el filtro IS: {survivors_count} de {processed_count} procesados.")
+            # --- FINALIZACIÓN DE OPTIMIZACIÓN ---
+            self.stop_monitor.set()
+            monitor_thread.join(timeout=5)
             
+            # Recuperar mejor estrategia para fase final si no hay supervivientes acumulados
+            if best_idx != -1:
+                all_is_results = [(self.strategy.get_params_by_index(best_idx), {"profit_factor": best_pf})]
+
+            self.logger.log(f"Búsqueda masiva completada. Mejor PF encontrado: {best_pf:.2f}")
             if not all_is_results:
-                self.logger.log("CRITICAL: Ninguna estrategia superó el filtro de supervivencia (PF > 1.0).")
+                self.logger.log("CRITICAL: Ninguna estrategia superó el filtro IS.")
                 return None
 
             # --- FASE 6: VALIDACIÓN MASIVA Y REPORTING (Todos los supervivientes) ---

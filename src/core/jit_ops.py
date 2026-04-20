@@ -2,6 +2,52 @@ import numpy as np
 from numba import njit
 
 @njit(cache=True, fastmath=True)
+def _njit_execution_engine(data, logic_id, params, signals_buf):
+    """
+    Despachador centralizado de lógicas de trading (HFT-ENGINE).
+    logic_id: Selector de kernel.
+    params: Vector plano de parámetros e índices de columnas.
+    """
+    if logic_id == 1:
+        # Lógica QuadMA basada en 4 columnas
+        _logic_quad_ma(data, params, signals_buf)
+    # elif logic_id == 2: ... (Nuevas lógicas aquí)
+
+@njit(cache=True, fastmath=True)
+def _logic_quad_ma(data, params, out_signals):
+    """
+    Kernel de ejecución para la estrategia QuadMA / FlexMA.
+    params: [fe_col, se_col, fx_col, sx_col, comm_factor, ...]
+    """
+    n = data.shape[0]
+    fe_col = int(params[0])
+    se_col = int(params[1])
+    fx_col = int(params[2])
+    sx_col = int(params[3])
+    
+    fe_raw = data[:, fe_col]
+    se_raw = data[:, se_col]
+    fx_raw = data[:, fx_col]
+    sx_raw = data[:, sx_col]
+    
+    current_pos = 0
+    for i in range(1, n):
+        # Lógica de Salida
+        new_pos = current_pos
+        if current_pos == 1:
+            if fx_raw[i] < sx_raw[i]: new_pos = 0
+        elif current_pos == -1:
+            if fx_raw[i] > sx_raw[i]: new_pos = 0
+        
+        # Lógica de Entrada
+        if new_pos == 0:
+            if fe_raw[i] > se_raw[i]: new_pos = 1
+            elif fe_raw[i] < se_raw[i]: new_pos = -1
+            
+        current_pos = new_pos
+        out_signals[i] = current_pos
+
+@njit(cache=True, fastmath=True)
 def _compute_quad_ma_signals_inplace(fe_ma, se_ma, fx_ma, sx_ma, out_signals):
     """Lógica de cruce de 4 medias optimizada con buffer pre-alocado."""
     n = len(fe_ma)

@@ -15,14 +15,13 @@ warnings.simplefilter('ignore', category=RuntimeWarning)
 from src.utils.process_guard import init_global_guard
 init_global_guard()
 
-from src.strategies.moving_average import MovingAverageStrategy
-from src.strategies.quad_ma import QuadMAStrategy
 from src.core.orchestrator import ValidationOrchestrator
 from src.core.config_loader import EnvironmentConfig
+from src.core.strategy_factory import get_strategy_instance
 from src.utils.data_gen import generate_sample_data
 
 # CONFIGURACIÓN GLOBAL POR DEFECTO
-DEFAULT_STRATEGY = "QuadMA"
+DEFAULT_STRATEGY = "FlexMA"  # Cambiado a FlexMA por defecto
 DEFAULT_TEMPLATE = "ggal_hft"
 
 def str2bool(v):
@@ -72,13 +71,11 @@ def main():
         print(f"Dataset no encontrado en {config.dataset_path}. Generando datos de muestra...")
         generate_sample_data(config.dataset_path, n_rows=10000)
 
-    # 3. Instanciar Estrategia
-    if args.strategy == "MovingAverage":
-        strategy = MovingAverageStrategy()
-    elif args.strategy == "QuadMA":
-        strategy = QuadMAStrategy()
-    else:
-        print(f"Error: Estrategia '{args.strategy}' no reconocida.")
+    # 3. Instanciar Estrategia Dinámicamente
+    try:
+        strategy = get_strategy_instance(args.strategy)
+    except Exception as e:
+        print(f"ERROR AL CARGAR ESTRATEGIA: {str(e)}")
         return
 
     print("--- Iniciando Backtester Framework ---")

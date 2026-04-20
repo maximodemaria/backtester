@@ -5,43 +5,14 @@ Soporta 14 tipos de indicadores y optimización de malla 4D.
 import numpy as np
 from src.core.base_strategy import BaseStrategy
 from src.core.jit_ops import (
-    _get_params_jit, 
-    _get_signals_by_indices_jit, 
-    _compute_quad_ma_signals
+    _njit_execution_engine
 )
 from src.indicators import (
     sma, ema, wma, hma, dema, tema, tma, rma, zlema, kama, alma, vwma,
     mcginley_dynamic, vidya
 )
 
-    def _params_to_idx(self, p: dict) -> int:
-        """
-        Inversa de get_params_by_index: convierte params en un global_idx.
-        """
-        t1 = self.ma_types.index(p['type_fe'])
-        t2 = self.ma_types.index(p['type_se'])
-        t3 = self.ma_types.index(p['type_fx'])
-        t4 = self.ma_types.index(p['type_sx'])
-        
-        # Encontrar índices de pares
-        p_entry = (p['fast_entry'], p['slow_entry'])
-        p_exit = (p['fast_exit'], p['slow_exit'])
-        
-        # Búsqueda de índice de par (lineal por ser solo ~210 elementos)
-        pair_entry_idx = -1
-        pair_exit_idx = -1
-        for i in range(self.n_pairs):
-            if self.legal_pairs[i, 0] == p_entry[0] and self.legal_pairs[i, 1] == p_entry[1]:
-                pair_entry_idx = i
-            if self.legal_pairs[i, 0] == p_exit[0] and self.legal_pairs[i, 1] == p_exit[1]:
-                pair_exit_idx = i
-        
-        idx_pairs = pair_entry_idx * self.n_pairs + pair_exit_idx
-        idx_types = (((t1 * self.n_types + t2) * self.n_types + t3) * self.n_types + t4)
-        
-        return idx_types * (self.n_pairs ** 2) + idx_pairs
-
-class QuadMAStrategy(BaseStrategy):
+class FlexMAStrategy(BaseStrategy):
     """
     Estrategia Flex-MA: 4 Medias Móviles con tipos INDEPENDIENTES. 
     Espacio de búsqueda escalado a ~1.7B de combinaciones.
@@ -70,6 +41,38 @@ class QuadMAStrategy(BaseStrategy):
             'rma', 'zlema', 'kama', 'alma', 'vwma', 'mcginley', 'vidya'
         ]
         self.n_types = len(self.ma_types)
+
+    def get_logic_id(self) -> int:
+        return 1  # ID registrado para QuadMA en jit_ops.py
+
+    def get_required_indicators(self) -> list:
+        indicators = []
+        for ma in self.ma_types:
+            for p in self.periods:
+                indicators.append((ma, p))
+        return indicators
+
+    def get_params_vector(self, idx: int, map_matrix: np.ndarray) -> np.ndarray:
+        """
+        Genera el vector de parámetros NJIT-friendly para el motor genérico.
+        [fe_col, se_col, fx_col, sx_col, comm_factor]
+        """
+        # 1. Obtener parámetros lógicos
+        p = self.get_params_by_index(idx)
+        
+        # 2. Resolver índices de tipos de media
+        t_fe = self.ma_types.index(p['type_fe'])
+        t_se = self.ma_types.index(p['type_se'])
+        t_fx = self.ma_types.index(p['type_fx'])
+        t_sx = self.ma_types.index(p['type_sx'])
+        
+        # 3. Resolver columnas usando la map_matrix
+        fe_col = map_matrix[t_fe, 0 if p['fast_entry'] == 1 else p['fast_entry'] // 10]
+        se_col = map_matrix[t_se, 0 if p['slow_entry'] == 1 else p['slow_entry'] // 10]
+        fx_col = map_matrix[t_fx, 0 if p['fast_exit'] == 1 else p['fast_exit'] // 10]
+        sx_col = map_matrix[t_sx, 0 if p['slow_exit'] == 1 else p['slow_exit'] // 10]
+        
+        return np.array([fe_col, se_col, fx_col, sx_col], dtype=np.float64)
 
     def get_params_by_index(self, global_idx: int) -> dict:
         """

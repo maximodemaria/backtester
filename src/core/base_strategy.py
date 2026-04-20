@@ -33,8 +33,26 @@ class BaseStrategy(ABC):
         """
 
     @abstractmethod
-    def generate_signal(self, data: np.ndarray, params: dict) -> np.ndarray:
+    def generate_signal(self, data: np.ndarray, params: dict, indicator_map: dict = None) -> np.ndarray:
         """
         Genera el vector de posiciones (-1, 0, 1) basado en los datos y parámetros.
-        DEBE ser vectorizado y llamar a una función decorada con @njit.
+        """
+
+    @abstractmethod
+    def get_logic_id(self) -> int:
+        """
+        Retorna el identificador numérico de la lógica NJIT registrada en jit_ops.
+        """
+
+    @abstractmethod
+    def get_required_indicators(self) -> list:
+        """
+        Retorna la lista de tuplas (ma_type, period) para pre-cálculo masivo.
+        """
+
+    @abstractmethod
+    def get_params_vector(self, idx: int) -> np.ndarray:
+        """
+        Retorna un vector plano de parámetros NJIT-friendly para la combinación 'idx'.
+        Este vector debe incluir los índices de las columnas de indicadores necesarios.
         """
