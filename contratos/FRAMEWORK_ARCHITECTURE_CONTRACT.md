@@ -36,8 +36,10 @@ class MiEstrategia(BaseStrategy):
 
 **Regla de Oro:** Queda estrictamente prohibido implementar bucles de cálculo de indicadores (SMA, EMA, RSI, etc.) dentro de las clases de estrategia.
 
-- **Uso Obligatorio:** Se debe utilizar exclusivamente la librería [src/indicators/indicators.py](file:///c:/Users/max/Desktop/Drive/backtester/src/indicators/indicators.py).
-- **Funciones Puras:** Los indicadores deben ser funciones `@njit` que reciben arrays y devuelven arrays.
+- **Uso Obligatorio:** Se debe utilizar exclusivamente la suite de indicadores ubicada en [src/indicators/](file:///c:/Users/max/Desktop/Drive/backtester/src/indicators/).
+- **Arquitectura Atomizada:** Cada indicador reside en su propio script individual (ej. `sma.py`, `rsi.py`). Esto permite un mantenimiento granular y evita archivos monolíticos.
+- **Registro de Nuevos Indicadores:** Para añadir un indicador, se debe crear un nuevo archivo `.py` en `src/indicators/` y exportarlo en el `__init__.py` de dicha carpeta.
+- **Funciones Puras:** Los indicadores deben ser funciones `@njit(cache=True)` que reciben arrays y devuelven arrays.
 - **Manejo de NaNs:** Las estrategias deben estar preparadas para manejar `np.nan` en los periodos iniciales de los indicadores.
 
 ---
