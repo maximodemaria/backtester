@@ -1,6 +1,6 @@
-"""
-Estrategia de ejemplo basada en el cruce de medias móviles.
-"""
+import numpy as np
+from numba import njit
+from src.core.base_strategy import BaseStrategy
 from src.indicators import sma
 
 class MovingAverageStrategy(BaseStrategy):

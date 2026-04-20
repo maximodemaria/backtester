@@ -38,25 +38,33 @@ class ValidationOrchestrator:
             is_data, oos_data = self.processor.split_is_oos(0.7)
             self.logger.log(f"Datos cargados. IS: {len(is_data)} | OOS: {len(oos_data)}")
 
-            # 2. Optimización / Backtesting Masivo (In-Sample)
+            # 2. Optimización / Backtesting Masivo (In-Sample) con Streaming
             params_list = self.strategy.param_grid
-            self.logger.log(f"Procesando {len(params_list)} permutaciones...")
+            self.logger.log(f"Procesando {len(params_list)} permutaciones en modo Streaming...")
 
-            is_results = []
-            is_signals_matrix = []
+            best_pf = -1
+            winner_params = None
+            winner_signals_is = None
+            survivors_count = 0
+            
+            # Recolectamos resultados solo de los que sobreviven para ahorrar memoria
+            is_results = [] 
 
             for params in params_list:
                 signals = self.strategy.generate_signal(is_data, params)
-                metrics = self.backtester.run(is_data, signals)
-                is_results.append((params, metrics))
-                is_signals_matrix.append(signals)
+                
+                # Test de Supervivencia Inmediato (Streaming)
+                if self.survival_tester.check_single_survival(is_data, signals):
+                    survivors_count += 1
+                    metrics = self.backtester.run(is_data, signals)
+                    is_results.append((params, metrics))
+                    
+                    # Actualizar ganador
+                    if metrics['profit_factor'] > best_pf:
+                        best_pf = metrics['profit_factor']
+                        winner_params = params
+                        winner_signals_is = signals # Solo guardamos la señal del mejor
 
-            is_signals_matrix = np.array(is_signals_matrix)
-
-            # 3. Test de Supervivencia (IS)
-            self.logger.log("Ejecutando Test de Supervivencia sobre IS...")
-            survival_mask = self.survival_tester.compute_survival_matrix(is_data, is_signals_matrix)
-            survivors_count = np.sum(survival_mask)
             self.logger.log(f"Supervivientes: {survivors_count} de {len(params_list)}")
 
             if survivors_count == 0:
@@ -64,20 +72,10 @@ class ValidationOrchestrator:
                 self.logger.log(msg)
                 return None
 
-            # 4. Selección del Ganador (Basado en PF en IS)
-            best_pf = -1
-            winner_idx = -1
-            for idx, (_, metrics) in enumerate(is_results):
-                if survival_mask[idx] and metrics['profit_factor'] > best_pf:
-                    best_pf = metrics['profit_factor']
-                    winner_idx = idx
-
-            winner_params, _ = is_results[winner_idx]
             self.logger.log(f"Ganador IS: {winner_params} | PF: {best_pf:.2f}")
 
-            # 5. Permutation Test (Bar-Shuffling) sobre el Ganador
+            # 3. Permutation Test (Bar-Shuffling) sobre el Ganador
             self.logger.log("Ejecutando Permutation Test (Monte Carlo)...")
-            winner_signals_is = is_signals_matrix[winner_idx]
             p_val = self.permutation_tester.run_test(is_data[:, 1], winner_signals_is, best_pf)
             status = "(Robusto)" if p_val < 0.05 else "(Poco Robusto)"
             self.logger.log(f"Quasi P-Value: {p_val:.4f} {status}")
@@ -85,7 +83,7 @@ class ValidationOrchestrator:
             # 6. Validación Final OOS
             self.logger.log("--- FASE FINAL: VALIDACIÓN OUT-OF-SAMPLE ---")
             winner_signals_oos = self.strategy.generate_signal(oos_data, winner_params)
-            oos_results = self.oos_validator.validate(oos_data, winner_signals_oos, str(winner_params))
+            oos_results = self.oos_validator.validate(oos_data, winner_signals_oos, str(winner_params), is_pf=best_pf)
 
             total_time = time.time() - start_time
             self.logger.log(f"Pipeline completado en {total_time:.2f} segundos.")

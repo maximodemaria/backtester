@@ -68,10 +68,11 @@ def _compute_metrics_jit(log_returns: np.ndarray, signals: np.ndarray) -> np.nda
     # Profit Factor
     profit_factor = pos_returns_sum / neg_returns_sum if neg_returns_sum != 0 else 1.0
 
-    # Sharpe Ratio simplificado
+    # Sharpe Ratio simplificado con estabilidad numérica
+    epsilon = 1e-9
     std_dev = np.std(strategy_returns)
     mean_ret = np.mean(strategy_returns)
     # Asumiendo diario para demo (anualización)
-    sharpe = (mean_ret / std_dev) * np.sqrt(252) if std_dev != 0 else 0.0
+    sharpe = (mean_ret / (std_dev + epsilon)) * np.sqrt(252) if std_dev != 0 else 0.0
 
     return np.array([profit_factor, np.exp(total_log_return) - 1, sharpe])
