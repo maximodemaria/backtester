@@ -1,14 +1,12 @@
 """
 Estrategia de ejemplo basada en el cruce de medias móviles.
 """
-import numpy as np
-from numba import njit
-from src.core.base_strategy import BaseStrategy
+from src.indicators import sma
 
 class MovingAverageStrategy(BaseStrategy):
     """
     Estrategia de Cruce de Medias Móviles optimizada.
-    Demuestra la integración entre la interfaz abstracta y el motor Numba.
+    Utiliza la librería centralizada de indicadores para los cálculos.
     """
 
     def __init__(self):
@@ -25,41 +23,35 @@ class MovingAverageStrategy(BaseStrategy):
 
     def generate_signal(self, data: np.ndarray, params: dict) -> np.ndarray:
         """
-        Envoltorio para llamar a la función compilada JIT.
+        Genera señales de trading basadas en el cruce de SMAs.
         data[:, 0] es Close.
         """
-        fast_p = params['fast_period']
-        slow_p = params['slow_period']
-        return _compute_ma_signals(data[:, 0], int(fast_p), int(slow_p))
+        fast_p = int(params['fast_period'])
+        slow_p = int(params['slow_period'])
+        
+        close = data[:, 0]
+        
+        # Obtenemos las series de indicadores desde la librería centralizada
+        sma_fast = sma(close, fast_p)
+        sma_slow = sma(close, slow_p)
+        
+        return _compute_cross_signals(sma_fast, sma_slow)
 
 @njit(cache=True)
-def _compute_ma_signals(close: np.ndarray, fast_p: int, slow_p: int) -> np.ndarray:
+def _compute_cross_signals(fast_ma: np.ndarray, slow_ma: np.ndarray) -> np.ndarray:
     """
-    Motor de señales JIT.
-    Calcula medias móviles simples y genera señales de compra (1) y venta (-1).
+    Lógica de decisión pura. 
+    Solo se encarga de comparar las series ya calculadas.
     """
-    n = len(close)
+    n = len(fast_ma)
     signals = np.zeros(n, dtype=np.int8)
 
-    # Evitamos procesar antes de tener suficientes datos
-    start_idx = max(fast_p, slow_p)
-
-    for i in range(start_idx, n):
-        # SMA Rápida
-        sum_fast = 0.0
-        for j in range(i - fast_p + 1, i + 1):
-            sum_fast += close[j]
-        sma_fast = sum_fast / fast_p
-
-        # SMA Lenta
-        sum_slow = 0.0
-        for j in range(i - slow_p + 1, i + 1):
-            sum_slow += close[j]
-        sma_slow = sum_slow / slow_p
-
-        if sma_fast > sma_slow:
+    for i in range(n):
+        # Las comparaciones con NaN (periodos incompletos) devuelven False.
+        # Esto evita señales espurias al inicio del dataset.
+        if fast_ma[i] > slow_ma[i]:
             signals[i] = 1
-        elif sma_fast < sma_slow:
+        elif fast_ma[i] < slow_ma[i]:
             signals[i] = -1
 
     return signals
